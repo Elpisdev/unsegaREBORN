@@ -1,7 +1,8 @@
 #include "exfat.h"
 #include <stdlib.h>
 #include <string.h>
-
+#include <errno.h>
+#include <stdio.h>
 #include <direct.h>
 #define MKDIR(path) _mkdir(path)
 #define PATH_SEPARATOR "\\"
@@ -39,8 +40,7 @@ static bool create_directories(const char* path) {
 }
 
 static uint32_t get_cluster_offset(ExfatContext* ctx, uint32_t cluster) {
-    return ctx->cluster_heap_offset_bytes +
-        ((cluster - 2) * ctx->bytes_per_cluster);
+    return ctx->cluster_heap_offset_bytes + ((cluster - 2) * ctx->bytes_per_cluster);
 }
 
 static bool read_cluster(ExfatContext* ctx, uint32_t cluster, void* buffer) {
@@ -49,6 +49,14 @@ static bool read_cluster(ExfatContext* ctx, uint32_t cluster, void* buffer) {
         return false;
     }
     return fread(buffer, 1, ctx->bytes_per_cluster, ctx->fp) == ctx->bytes_per_cluster;
+}
+
+static uint32_t get_next_cluster(ExfatContext* ctx, uint32_t cluster) {
+    uint32_t next = ctx->fat[cluster];
+    if (next >= 0xFFFFFFF8) {
+        return 0; // end-of-chain
+    }
+    return next;
 }
 
 static void combine_path(char* dest, size_t dest_size, const char* dir, const char* name) {
@@ -76,34 +84,120 @@ static bool extract_file(ExfatContext* ctx, ExfatFileInfo* file, const char* out
     uint32_t current_cluster = file->first_cluster;
     uint64_t remaining = file->data_length;
     uint8_t* buffer = malloc(ctx->bytes_per_cluster);
-
     if (!buffer) {
         fclose(out);
         return false;
     }
 
     bool success = true;
-    while (remaining > 0 && success) {
+    while (remaining > 0 && current_cluster != 0 && success) {
         if (!read_cluster(ctx, current_cluster, buffer)) {
             success = false;
             break;
         }
 
-        size_t write_size = (remaining > ctx->bytes_per_cluster) ?
-            ctx->bytes_per_cluster : (size_t)remaining;
-
+        size_t write_size = (remaining > ctx->bytes_per_cluster) ? ctx->bytes_per_cluster : (size_t)remaining;
         if (fwrite(buffer, 1, write_size, out) != write_size) {
             success = false;
             break;
         }
 
         remaining -= write_size;
-        current_cluster++;
+        current_cluster = get_next_cluster(ctx, current_cluster);
     }
 
     free(buffer);
     fclose(out);
     return success;
+}
+
+static bool process_directory(ExfatContext* ctx, uint32_t start_cluster, const char* output_dir) {
+    uint8_t* cluster_buffer = malloc(ctx->bytes_per_cluster);
+    if (!cluster_buffer) {
+        return false;
+    }
+
+    uint32_t current_cluster = start_cluster;
+    bool finished = false;
+
+    while (!finished && current_cluster != 0) {
+        if (!read_cluster(ctx, current_cluster, cluster_buffer)) {
+            free(cluster_buffer);
+            return false;
+        }
+
+        uint32_t entries_per_cluster = ctx->bytes_per_cluster / EXFAT_ENTRY_SIZE;
+        uint8_t* entry_ptr = cluster_buffer;
+        for (uint32_t i = 0; i < entries_per_cluster; ) {
+            uint8_t entry_type = *entry_ptr;
+            if (entry_type == EXFAT_ENTRY_EOD) {
+                finished = true;
+                break;
+            }
+
+            if (entry_type == EXFAT_ENTRY_FILE) {
+                ExfatFileEntry* file_entry = (ExfatFileEntry*)entry_ptr;
+                ExfatStreamEntry* stream_entry = (ExfatStreamEntry*)(entry_ptr + EXFAT_ENTRY_SIZE);
+                if (stream_entry->entry_type != EXFAT_ENTRY_STREAM) {
+                    i++;
+                    entry_ptr += EXFAT_ENTRY_SIZE;
+                    continue;
+                }
+                int total_name_chars = stream_entry->name_length;
+                int num_name_entries = (total_name_chars + 14) / 15;
+
+                char full_name[MAX_FILENAME_LENGTH];
+                int pos = 0;
+                uint8_t* name_entry_ptr = entry_ptr + EXFAT_ENTRY_SIZE * 2;
+                for (int k = 0; k < num_name_entries; k++) {
+                    ExfatFileNameEntry* name_entry = (ExfatFileNameEntry*)(name_entry_ptr + k * EXFAT_ENTRY_SIZE);
+                    int chars_in_this_entry = (total_name_chars - k * 15 < 15) ? (total_name_chars - k * 15) : 15;
+                    for (int j = 0; j < chars_in_this_entry; j++) {
+                        if (pos < MAX_FILENAME_LENGTH - 1) {
+                            full_name[pos++] = (char)(name_entry->file_name[j] & 0xFF);
+                        }
+                    }
+                }
+                full_name[pos] = '\0';
+
+                ExfatFileInfo file_info;
+                memset(&file_info, 0, sizeof(file_info));
+                strncpy(file_info.name, full_name, MAX_PATH_LENGTH - 1);
+                file_info.name[MAX_PATH_LENGTH - 1] = '\0';
+                file_info.first_cluster = stream_entry->first_cluster;
+                file_info.data_length = stream_entry->data_length;
+                file_info.is_directory = ((file_entry->file_attributes & 0x10) != 0);
+
+                char full_path[MAX_PATH_LENGTH];
+                combine_path(full_path, sizeof(full_path), output_dir, file_info.name);
+
+                if (file_info.is_directory) {
+                    if (create_directories(full_path)) {
+                        process_directory(ctx, file_info.first_cluster, full_path);
+                    }
+                }
+                else {
+                    extract_file(ctx, &file_info, full_path);
+                }
+
+                int total_entries = 2 + num_name_entries;
+                i += total_entries;
+                entry_ptr += EXFAT_ENTRY_SIZE * total_entries;
+                continue;
+            }
+            else {
+                i++;
+                entry_ptr += EXFAT_ENTRY_SIZE;
+            }
+        }
+
+        if (!finished) {
+            current_cluster = get_next_cluster(ctx, current_cluster);
+        }
+    }
+
+    free(cluster_buffer);
+    return true;
 }
 
 bool exfat_init(ExfatContext* ctx, const char* filename) {
@@ -119,72 +213,31 @@ bool exfat_init(ExfatContext* ctx, const char* filename) {
         return false;
     }
 
-    ctx->bytes_per_cluster = (1 << ctx->boot_sector.bytes_per_sector_shift) *
-        (1 << ctx->boot_sector.sectors_per_cluster_shift);
+    ctx->bytes_per_sector = (1 << ctx->boot_sector.bytes_per_sector_shift);
+    ctx->bytes_per_cluster = ctx->bytes_per_sector * (1 << ctx->boot_sector.sectors_per_cluster_shift);
+    ctx->cluster_heap_offset_bytes = ctx->boot_sector.cluster_heap_offset * ctx->bytes_per_sector;
 
-    ctx->cluster_heap_offset_bytes = ctx->boot_sector.cluster_heap_offset *
-        (1 << ctx->boot_sector.bytes_per_sector_shift);
+    ctx->fat_offset_bytes = ctx->boot_sector.fat_offset * ctx->bytes_per_sector;
+    ctx->fat_length_bytes = ctx->boot_sector.fat_length * ctx->bytes_per_sector;
 
-    return true;
-}
-
-static bool process_directory(ExfatContext* ctx, uint32_t cluster,
-    const char* output_dir) {
-    uint8_t* buffer = malloc(ctx->bytes_per_cluster);
-    if (!buffer) {
+    ctx->fat = malloc(ctx->fat_length_bytes);
+    if (!ctx->fat) {
+        fclose(ctx->fp);
         return false;
     }
 
-    if (!read_cluster(ctx, cluster, buffer)) {
-        free(buffer);
+    if (fseek(ctx->fp, ctx->fat_offset_bytes, SEEK_SET) != 0) {
+        free(ctx->fat);
+        fclose(ctx->fp);
         return false;
     }
 
-    uint32_t entries_per_cluster = ctx->bytes_per_cluster / EXFAT_ENTRY_SIZE;
-    uint8_t* entry = buffer;
-
-    for (uint32_t i = 0; i < entries_per_cluster; i++) {
-        if (*entry == EXFAT_ENTRY_EOD) {
-            break;
-        }
-
-        if (*entry == EXFAT_ENTRY_FILE) {
-            ExfatFileEntry* file_entry = (ExfatFileEntry*)entry;
-            ExfatStreamEntry* stream_entry = (ExfatStreamEntry*)(entry + EXFAT_ENTRY_SIZE);
-            ExfatFileNameEntry* name_entry = (ExfatFileNameEntry*)(entry + EXFAT_ENTRY_SIZE * 2);
-
-            if (stream_entry->entry_type == EXFAT_ENTRY_STREAM) {
-                ExfatFileInfo file_info;
-                memset(&file_info, 0, sizeof(file_info));
-
-                char* name_ptr = file_info.name;
-                for (int j = 0; j < stream_entry->name_length && j < 15; j++) {
-                    *name_ptr++ = (char)(name_entry->file_name[j] & 0xFF);
-                }
-                *name_ptr = '\0';
-
-                file_info.first_cluster = stream_entry->first_cluster;
-                file_info.data_length = stream_entry->data_length;
-                file_info.is_directory = (file_entry->file_attributes & 0x10) != 0;
-
-                char full_path[MAX_PATH_LENGTH];
-                combine_path(full_path, sizeof(full_path), output_dir, file_info.name);
-
-                if (file_info.is_directory) {
-                    if (create_directories(full_path)) {
-                        process_directory(ctx, file_info.first_cluster, full_path);
-                    }
-                }
-                else {
-                    extract_file(ctx, &file_info, full_path);
-                }
-            }
-        }
-
-        entry += EXFAT_ENTRY_SIZE;
+    if (fread(ctx->fat, 1, ctx->fat_length_bytes, ctx->fp) != ctx->fat_length_bytes) {
+        free(ctx->fat);
+        fclose(ctx->fp);
+        return false;
     }
 
-    free(buffer);
     return true;
 }
 
@@ -192,13 +245,16 @@ bool exfat_extract_all(ExfatContext* ctx, const char* output_dir) {
     if (!create_directories(output_dir)) {
         return false;
     }
-    return process_directory(ctx, ctx->boot_sector.first_cluster_of_root_dir,
-        output_dir);
+    return process_directory(ctx, ctx->boot_sector.first_cluster_of_root_dir, output_dir);
 }
 
 void exfat_close(ExfatContext* ctx) {
     if (ctx->fp) {
         fclose(ctx->fp);
         ctx->fp = NULL;
+    }
+    if (ctx->fat) {
+        free(ctx->fat);
+        ctx->fat = NULL;
     }
 }
