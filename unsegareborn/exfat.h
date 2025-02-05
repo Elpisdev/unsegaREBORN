@@ -12,8 +12,8 @@
 #define EXFAT_ENTRY_EOD          0x00
 #define EXFAT_ENTRY_BITMAP       0x81
 #define EXFAT_ENTRY_FILE         0x85
-#define EXFAT_ENTRY_STREAM      0xC0
-#define EXFAT_ENTRY_FILENAME    0xC1
+#define EXFAT_ENTRY_STREAM       0xC0
+#define EXFAT_ENTRY_FILENAME     0xC1
 
 #pragma pack(push, 1)
 
@@ -74,7 +74,7 @@ typedef struct {
 typedef struct {
     uint8_t entry_type;
     uint8_t flags;
-    uint16_t file_name[15];
+    uint16_t file_name[15];  // please work
 } ExfatFileNameEntry;
 
 #pragma pack(pop)
@@ -89,8 +89,12 @@ typedef struct {
 typedef struct {
     FILE* fp;
     ExfatBootSector boot_sector;
+    uint32_t bytes_per_sector;
     uint32_t bytes_per_cluster;
     uint32_t cluster_heap_offset_bytes;
+    uint32_t fat_offset_bytes;
+    uint32_t fat_length_bytes;
+    uint32_t* fat;
 } ExfatContext;
 
 bool exfat_init(ExfatContext* ctx, const char* filename);
