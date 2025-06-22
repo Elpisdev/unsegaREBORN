@@ -54,6 +54,10 @@ static uint32_t get_next_cluster(ExfatContext* ctx, uint32_t cluster) {
     if (next >= 0xFFFFFFF8) {
         return 0; // end-of-chain
     }
+    if (next == 0)
+    {
+        return cluster + 1; // if cluster in FAT is 0, it means the cluster heap is continous (exfat only)
+    }
     return next;
 }
 
