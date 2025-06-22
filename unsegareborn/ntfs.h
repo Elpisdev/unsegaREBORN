@@ -7,20 +7,15 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include "common.h"
 
-#include <direct.h>
-#define MKDIR(path) _mkdir(path)
-#define PATH_SEPARATOR "\\"
 #define fseeko _fseeki64
 #define ftello _ftelli64
 
 #define VHD_FOOTER_SIZE 512
 #define VHD_SECTOR_SIZE 512
 #define VHD_BAT_ENTRY_RESERVED 0xFFFFFFFF
-#define MAX_PATH_LENGTH 4096
 #define NTFS_RECORD_SIZE 1024
-#define MAX_FILENAME_LENGTH 256
-#define BUFFER_SIZE 65536
 #define MFT_RECORD_MAGIC "FILE"
 #define VHD_COOKIE "conectix"
 #define VHD_DYNAMIC_COOKIE "cxsparse"

@@ -1,5 +1,7 @@
 #include "ntfs.h"
 #include <time.h>
+#include <locale.h>
+#define BUFFER_SIZE 65536
 
 static uint16_t swap16(uint16_t value) {
     return ((value & 0xFF00) >> 8) | ((value & 0x00FF) << 8);
@@ -58,11 +60,11 @@ static bool create_directories(const char* path) {
 }
 
 static void convert_name_to_ascii(const uint16_t* utf16_name, int name_length, char* ascii_name) {
-    int i;
-    for (i = 0; i < name_length && i < MAX_FILENAME_LENGTH - 1; i++) {
-        ascii_name[i] = (char)(utf16_name[i] & 0xFF);
-    }
-    ascii_name[i] = '\0';
+    // just convert it
+    _locale_t locale = _create_locale(LC_ALL, "");
+    int real_name_length = min(name_length, MAX_FILENAME_LENGTH - 1);
+    _wcstombs_l(ascii_name, utf16_name, real_name_length, locale);
+    ascii_name[real_name_length] = '\0';
 }
 
 static bool ntfs_read(NTFSContext* ctx, void* buffer, uint64_t offset, size_t size) {
@@ -810,8 +812,7 @@ bool ntfs_extract_all(NTFSContext* ctx) {
 
     printf("\rProgress: 100%%\n");
 
-    printf("Extraction completed.\n",
-        (unsigned long long)processed_records, (unsigned long long)extracted_records);
+    printf("Extraction completed.\n");
 
     free(record_buffer);
     return true;
