@@ -51,7 +51,9 @@ You can also just drag and drop the image(s) on the program. ("-no" flag is disa
 ## Where do the keys come from?
 
 They were all collected from leaks over time. 
+
 If you have additional keys and want to contribute, feel free to open a PR.
+
 If you are a gatekeeper, you can just use the built in custom key function.
 
 ## License
@@ -61,4 +63,5 @@ UNLICENSE
 ## Caveats / TODO
 
 No APM3 support. Maybe will be added when I feel like it.
+
 Child VHD won't be processed for app files. If the output VHD number is not zero (e.g. internal_1, internal_2) you are on your own.
