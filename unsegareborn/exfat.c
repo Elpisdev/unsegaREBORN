@@ -3,9 +3,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
-#include <direct.h>
-#define MKDIR(path) _mkdir(path)
-#define PATH_SEPARATOR "\\"
+#include <locale.h>
 
 static bool create_directories(const char* path) {
     char temp[MAX_PATH_LENGTH];
@@ -55,6 +53,10 @@ static uint32_t get_next_cluster(ExfatContext* ctx, uint32_t cluster) {
     uint32_t next = ctx->fat[cluster];
     if (next >= 0xFFFFFFF8) {
         return 0; // end-of-chain
+    }
+    if (next == 0)
+    {
+        return cluster + 1; // if cluster in FAT is 0, it means the cluster heap is continous (exfat only)
     }
     return next;
 }
@@ -147,6 +149,7 @@ static bool process_directory(ExfatContext* ctx, uint32_t start_cluster, const c
                 int num_name_entries = (total_name_chars + 14) / 15;
 
                 char full_name[MAX_FILENAME_LENGTH];
+                wchar_t full_name_unicode[MAX_FILENAME_LENGTH];
                 int pos = 0;
                 uint8_t* name_entry_ptr = entry_ptr + EXFAT_ENTRY_SIZE * 2;
                 for (int k = 0; k < num_name_entries; k++) {
@@ -154,11 +157,16 @@ static bool process_directory(ExfatContext* ctx, uint32_t start_cluster, const c
                     int chars_in_this_entry = (total_name_chars - k * 15 < 15) ? (total_name_chars - k * 15) : 15;
                     for (int j = 0; j < chars_in_this_entry; j++) {
                         if (pos < MAX_FILENAME_LENGTH - 1) {
-                            full_name[pos++] = (char)(name_entry->file_name[j] & 0xFF);
+                            // you shouldn't cut of the wide char
+                            full_name_unicode[pos++] = (wchar_t)name_entry->file_name[j];
                         }
                     }
                 }
-                full_name[pos] = '\0';
+                full_name_unicode[pos] = L'\0';
+
+                // just convert it
+                _locale_t locale = _create_locale(LC_ALL, "");
+                _wcstombs_l(full_name, full_name_unicode, MAX_FILENAME_LENGTH, locale);
 
                 ExfatFileInfo file_info;
                 memset(&file_info, 0, sizeof(file_info));

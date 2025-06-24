@@ -4,10 +4,9 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include "common.h"
 
 #define EXFAT_ENTRY_SIZE 32
-#define MAX_PATH_LENGTH 256
-#define MAX_FILENAME_LENGTH 256
 
 #define EXFAT_ENTRY_EOD          0x00
 #define EXFAT_ENTRY_BITMAP       0x81
