@@ -36,9 +36,11 @@ build.bat --static       :: static CRT + OpenSSL
 
 ## Usage
 
+```bash
 unsegareborn [-no] <image1> [image2 …]
 
   -no   just decrypt, do NOT auto-extract the embedded file system
+```
 
 The program writes a decrypted .ntfs or .exfat file next to the input
 and, unless -no is given, immediately unpacks its contents into a folder
