@@ -24,13 +24,15 @@ An all-in-one tool that unpacks (and optionally extracts) arcade SEGA images.
 ./build.sh               # release build
 ./build.sh --debug       # debug symbols, no optimisation
 ./build.sh --static      # link everything statically
+```
 
 ### Windows (MSVC or MinGW)
 
+```bash
 build.bat                :: release build
 build.bat --debug        :: debug build
 build.bat --static       :: static CRT + OpenSSL
-
+```
 
 ## Usage
 
