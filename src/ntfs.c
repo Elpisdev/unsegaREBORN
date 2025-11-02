@@ -118,6 +118,51 @@ static bool ntfs_read(NTFSContext* ctx, void* buffer, uint64_t offset, size_t si
     return fread(buffer, 1, size, ctx->raw.fp) == size;
 }
 
+static bool apply_mft_fixups(const NTFSContext* ctx, uint8_t* record_buffer, size_t record_size) {
+    (void)ctx;
+    if (!record_buffer || record_size < sizeof(MFTRecordHeader)) {
+        return false;
+    }
+
+    MFTRecordHeader* header = (MFTRecordHeader*)record_buffer;
+    uint16_t usa_offset = header->usa_offset;
+    uint16_t usa_count = header->usa_count;
+
+    if (usa_offset == 0 || usa_count < 2) {
+        return true;
+    }
+
+    size_t max_entries_available = 0;
+    if ((size_t)usa_offset < record_size) {
+        max_entries_available = (record_size - (size_t)usa_offset) / sizeof(uint16_t);
+    }
+    if (max_entries_available < 2) {
+        return true;
+    }
+    if (usa_count > (uint16_t)max_entries_available) {
+        usa_count = (uint16_t)max_entries_available;
+    }
+
+    uint16_t* usa = (uint16_t*)(record_buffer + usa_offset);
+
+    uint16_t num_sectors = (usa_count >= 1) ? (uint16_t)(usa_count - 1) : 0;
+    if (num_sectors == 0) {
+        return true;
+    }
+
+    for (uint16_t i = 1; i <= num_sectors; i++) {
+        size_t end_offset = ((size_t)i * record_size) / num_sectors;
+        if (end_offset < 2 || end_offset > record_size) {
+            continue;
+        }
+        size_t tail_offset = end_offset - 2;
+        uint16_t* tail = (uint16_t*)(record_buffer + tail_offset);
+        *tail = usa[i];
+    }
+
+    return true;
+}
+
 static bool read_file_info(NTFSContext* ctx, uint64_t ref_number, FileInfo* info) {
     memset(info, 0, sizeof(FileInfo));
 
@@ -129,6 +174,10 @@ static bool read_file_info(NTFSContext* ctx, uint64_t ref_number, FileInfo* info
 
     bool success = false;
     if (ntfs_read(ctx, record_buffer, mft_offset, ctx->mft_record_size)) {
+        if (!apply_mft_fixups(ctx, record_buffer, ctx->mft_record_size)) {
+            free(record_buffer);
+            return false;
+        }
         const MFTRecordHeader* record = (const MFTRecordHeader*)record_buffer;
 
         if (memcmp(record->magic, "FILE", 4) == 0 && (record->flags & MFT_RECORD_IN_USE)) {
@@ -779,6 +828,13 @@ bool ntfs_init(NTFSContext* ctx, const char* path, const char* extract_path) {
         return false;
     }
 
+    if (!apply_mft_fixups(ctx, mft_record, ctx->mft_record_size)) {
+        printf("Failed to apply MFT fixups on record 0\n");
+        free(mft_record);
+        ntfs_close(ctx);
+        return false;
+    }
+
     const MFTRecordHeader* record = (const MFTRecordHeader*)mft_record;
     if (memcmp(record->magic, "FILE", 4) != 0) {
         printf("Invalid MFT record signature\n");
@@ -831,6 +887,12 @@ bool ntfs_extract_all(NTFSContext* ctx) {
     for (uint64_t i = 0; i < total_records; i++) {
         if (!ntfs_read(ctx, record_buffer, current_offset, ctx->mft_record_size)) {
             printf("Failed to read MFT record at offset 0x%llX\n",
+                (unsigned long long)current_offset);
+            break;
+        }
+
+        if (!apply_mft_fixups(ctx, record_buffer, ctx->mft_record_size)) {
+            printf("Failed to apply MFT fixups at offset 0x%llX\n",
                 (unsigned long long)current_offset);
             break;
         }
