@@ -1,0 +1,7 @@
+# build outputs
+build/
+*.o
+*.obj
+
+# keys (use keys.inc.example as template)
+include/keys.inc

@@ -1,0 +1,76 @@
+:<<"::BATCH_SECTION"
+@echo off
+goto :WINDOWS
+::BATCH_SECTION
+#!/bin/sh
+set -e
+mkdir -p build
+
+SRC="src/lib.c src/main.c src/crypto.c src/keys.c src/exfat.c src/ntfs.c src/stream.c src/aes.c"
+
+# Check for clang
+command -v clang >/dev/null 2>&1 || { echo "error: clang not found"; exit 1; }
+
+# Detect OS
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        OUT="build/unsegareborn-win-x64.exe"
+        CFLAGS="-target x86_64-pc-windows-gnu -Oz -maes -msse4.1 -I include -fno-asynchronous-unwind-tables -fno-ident -ffunction-sections -fdata-sections -flto -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -fno-unwind-tables -fno-exceptions -fmerge-all-constants -fno-addrsig"
+        LDFLAGS="-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all -Wl,-e,_start -Wl,--subsystem,console -Wl,-s -Wl,--lto-Oz -L/mingw64/lib"
+        LIBS="-lntdll"
+        ;;
+    *)
+        OUT="build/unsegareborn-linux-x64"
+        CFLAGS="-Oz -maes -msse4.1 -I include -fno-asynchronous-unwind-tables -fno-ident -ffunction-sections -fdata-sections -flto -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -fno-unwind-tables -fno-exceptions -fmerge-all-constants -fno-addrsig"
+        LDFLAGS="-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all -Wl,-e,_start -Wl,-s -Wl,--lto-O2 -static"
+        LIBS=""
+        ;;
+esac
+
+echo "building..."
+clang $CFLAGS $LDFLAGS -o $OUT $SRC $LIBS
+echo "done: $OUT ($(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT") bytes)"
+exit 0
+
+:WINDOWS
+setlocal
+if not exist build mkdir build
+
+set SRC=src\lib.c src\main.c src\crypto.c src\keys.c src\exfat.c src\ntfs.c src\stream.c src\aes.c
+
+:: Find Clang
+where clang >nul 2>&1 || (
+    for %%P in (
+        "C:\Program Files\LLVM\bin"
+        "C:\LLVM\bin"
+        "%LOCALAPPDATA%\LLVM\bin"
+        "C:\msys64\clang64\bin"
+        "C:\msys64\mingw64\bin"
+    ) do if exist "%%~P\clang.exe" set "PATH=%%~P;%PATH%"& goto :clang_found
+    echo error: clang not found - install LLVM or add to PATH
+    exit /b 1
+)
+:clang_found
+
+:: Find libraries
+set LIBPATH=
+for %%L in (
+    "C:\msys64\mingw64\lib"
+    "C:\msys64\clang64\lib"
+    "C:\msys64\ucrt64\lib"
+) do if exist "%%~L\libntdll.a" set "LIBPATH=-L%%~L"& goto :lib_found
+:lib_found
+
+set CFLAGS=-target x86_64-pc-windows-gnu -Oz -maes -msse4.1 -I include -fno-asynchronous-unwind-tables -fno-ident -ffunction-sections -fdata-sections -flto -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -fno-unwind-tables -fno-exceptions -fmerge-all-constants -fno-addrsig
+set LDFLAGS=-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all -Wl,-e,_start -Wl,--subsystem,console -Wl,-s -Wl,--lto-Oz %LIBPATH%
+
+echo building...
+clang %CFLAGS% %LDFLAGS% -o build\unsegareborn-win-x64.exe %SRC% -lntdll
+
+if exist build\unsegareborn-win-x64.exe (
+    for %%F in (build\unsegareborn-win-x64.exe) do echo done: %%~nxF ^(%%~zF bytes^)
+) else (
+    echo build failed
+    exit /b 1
+)
+exit /b 0
