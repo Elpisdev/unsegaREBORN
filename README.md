@@ -4,12 +4,12 @@ SEGA arcade image toolkit
 
 ## features
 
-- support for APP/PACK and OPT (including APM3 type)
-- support for NTFS and exFAT
-- support for VHD (fixed, dynamic, differencing)
-- stream directly from encrypted image (no temporary files)
-- preserved timestamps
-- AES-NI hardware accelerated
+- APP/PACK and OPT (including APM3 type)
+- NTFS and exFAT
+- VHD (fixed, dynamic, differencing)
+- direct stream from encrypted image
+- timestamps
+- AES-NI hardware acceleration
 
 ## build
 
@@ -35,20 +35,21 @@ flags:
 - `-s` silent
 - `-v` verbose
 - `-vn` version
+- `-h` available flags
 
 ### deltas (differencing VHD)
 
-base + update files are stacked into a single output directory named after the latest delta. files are automatically sorted by actual order.
+base + update files are stacked into a single output by order.
 
 ```
-unsegareborn -o out -p BASE.opt/app DELTA1.opt/app DELTA2.opt/app
+unsegareborn -o out -p BASE DELTA1 DELTA2
 ```
 
-result: `out/DELTA2_*/` with merged content (base + all updates applied in order)
+result: `out/DELTA2/` with merged content (base + all updates applied in order)
 
 ### drag and drop
 
-drag and drop works on windows. multiple files are handled automatically. the earliest file on drag selection order is used as parent, the rest are applied as updates in order. no flags needed.
+drag and drop is available on windows. multiple files are handled automatically.
 
 ## keys
 
@@ -62,8 +63,6 @@ format:
 ```c
 {"SDEZ", {0xd1,0x36,...}},
 ```
-
-iv values are derived automatically from the key and ciphertext
 
 ## platforms
 
