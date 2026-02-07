@@ -20,6 +20,8 @@ jobs:
         run: printf '%s\n' "$KEYS" > include/keys.inc
       - name: build
         shell: msys2 {0}
+        env:
+          DATECODE: ${{ github.ref_name }}
         run: sh build.cmd
       - uses: actions/upload-artifact@v4
         with:
@@ -39,6 +41,8 @@ jobs:
           KEYS: ${{ secrets.KEYS_INC }}
         run: printf '%s\n' "$KEYS" > include/keys.inc
       - run: sed 's/\r$//' build.cmd | sh
+        env:
+          DATECODE: ${{ github.ref_name }}
       - uses: actions/upload-artifact@v4
         with:
           name: linux-x64
