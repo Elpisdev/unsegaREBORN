@@ -241,6 +241,7 @@ typedef struct {
     uint64_t data_start_offset;
     bool silent;
     bool verbose;
+    bool scan_only;
     uint64_t extracted_bytes;
     uint64_t files_extracted;
     int highest_extracted_vhd;

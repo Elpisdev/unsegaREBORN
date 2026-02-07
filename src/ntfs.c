@@ -538,6 +538,7 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
         if (is_opt_file) {
             return store_pending_opt(ctx, filename, record);
         }
+        if (ctx->scan_only) return true;
     }
 
     uint64_t file_size = 0;
@@ -740,21 +741,23 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
     }
 
     if (is_directory) {
-        if (!create_directories(full_path)) {
-            return false;
-        }
-
-        if (modification_time != 0) {
-            DeferredDirTime* dirs = (DeferredDirTime*)ctx->deferred_dirs;
-            if (ctx->deferred_count >= ctx->deferred_capacity) {
-                if (grow_deferred_dirs(&dirs, &ctx->deferred_capacity))
-                    ctx->deferred_dirs = dirs;
+        if (!ctx->scan_only) {
+            if (!create_directories(full_path)) {
+                return false;
             }
-            if (ctx->deferred_count < ctx->deferred_capacity) {
-                DeferredDirTime* d = &dirs[ctx->deferred_count++];
-                STRCPY_S(d->path, sizeof(d->path), full_path);
-                d->mtime = modification_time;
-                d->atime = access_time;
+
+            if (modification_time != 0) {
+                DeferredDirTime* dirs = (DeferredDirTime*)ctx->deferred_dirs;
+                if (ctx->deferred_count >= ctx->deferred_capacity) {
+                    if (grow_deferred_dirs(&dirs, &ctx->deferred_capacity))
+                        ctx->deferred_dirs = dirs;
+                }
+                if (ctx->deferred_count < ctx->deferred_capacity) {
+                    DeferredDirTime* d = &dirs[ctx->deferred_count++];
+                    STRCPY_S(d->path, sizeof(d->path), full_path);
+                    d->mtime = modification_time;
+                    d->atime = access_time;
+                }
             }
         }
 
@@ -1392,7 +1395,7 @@ bool ntfs_init_stream(NTFSContext* ctx, DecryptStream* stream, const char* extra
 #define MFT_BATCH_RECORDS 1024
 
 bool ntfs_extract_all(NTFSContext* ctx) {
-    if (!create_directories(ctx->base_path)) return false;
+    if (!ctx->scan_only && !create_directories(ctx->base_path)) return false;
 
     bool ok = true;
     ctx->extracted_bytes = 0;

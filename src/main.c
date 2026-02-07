@@ -93,6 +93,40 @@ static inline void path_join(char* dest, size_t size, const char* dir, const cha
     }
 }
 
+static void finalize_group(AppContext* ctx) {
+    if (ctx->cached_parent.vhd) {
+        if (!ctx->cached_parent_consumed || ctx->keep_versions) {
+            uint64_t vf = 0, vb = 0;
+            if (vhd_extract_ntfs(ctx->cached_parent.vhd, ctx->cached_parent_dir,
+                                 ctx->silent, ctx->verbose, &vf, &vb)) {
+                ctx->total_files_extracted += vf;
+                ctx->total_bytes_extracted += vb;
+            }
+        }
+    }
+    free_cached_parent(&ctx->cached_parent);
+    if (ctx->stacked_final_name[0] && ctx->cached_parent_output_dir[0]) {
+        rename(ctx->cached_parent_output_dir, ctx->stacked_final_name);
+        if (ctx->stacked_final_inner[0]) {
+            size_t outer_len = strlen(ctx->cached_parent_output_dir);
+            const char* inner_suffix = ctx->cached_parent_dir + outer_len;
+            char old_inner[MAX_PATH_LENGTH];
+            snprintf(old_inner, sizeof(old_inner), "%s%s",
+                     ctx->stacked_final_name, inner_suffix);
+            char new_inner[MAX_PATH_LENGTH];
+            path_join(new_inner, sizeof(new_inner),
+                      ctx->stacked_final_name, ctx->stacked_final_inner);
+            if (strcmp(old_inner, new_inner) != 0)
+                rename(old_inner, new_inner);
+        }
+    }
+    ctx->cached_parent_consumed = false;
+    ctx->stacked_to_parent = false;
+    ctx->cached_parent_output_dir[0] = '\0';
+    ctx->stacked_final_name[0] = '\0';
+    ctx->stacked_final_inner[0] = '\0';
+}
+
 static void remove_dir_tree(const char* dir_path) {
     char search[MAX_PATH_LENGTH];
     snprintf(search, sizeof(search), "%s%s*", dir_path, PATH_SEPARATOR);
@@ -286,6 +320,7 @@ static void copy_runs_from_opt(RunSource* dst, const PendingOpt* opt, void* ntfs
 
 #define EXTRACT_F_ALLOW_VHD         0x01
 #define EXTRACT_F_RMDIR_ON_ORPHAN   0x02
+#define EXTRACT_F_SCAN_ONLY         0x04
 
 static void strip_extension(char* path) {
     char* ext = strrchr(path, '.');
@@ -529,6 +564,7 @@ static bool extract_stream_fs(AppContext* app_ctx, DecryptStream* stream,
             VERBOSE(app_ctx, "MFT=%llu c=%u\n",
                 (unsigned long long)ctx->total_mft_records, ctx->bytes_per_cluster);
 
+            if (flags & EXTRACT_F_SCAN_ONLY) ctx->scan_only = true;
             ctx->silent = true;
             if (ntfs_extract_all(ctx)) {
                 ctx->silent = app_ctx->silent;
@@ -924,6 +960,8 @@ static ErrorCode do_stream(AppContext* app_ctx, const char* path) {
             VERBOSE(app_ctx, "MFT=%llu c=%u\n",
                 (unsigned long long)ctx->total_mft_records, ctx->bytes_per_cluster);
 
+            if (!app_ctx->caching_parent && app_ctx->cached_parent.vhd && !app_ctx->keep_versions)
+                ctx->scan_only = true;
             ctx->silent = true;
 
             if (ntfs_extract_all(ctx)) {
@@ -982,8 +1020,10 @@ static ErrorCode do_stream(AppContext* app_ctx, const char* path) {
         }
     }
     else {
-        extraction_success = extract_stream_fs(app_ctx, stream, output_dir, FS_NTFS,
-                                               EXTRACT_F_ALLOW_VHD);
+        uint32_t eflags = EXTRACT_F_ALLOW_VHD;
+        if (!app_ctx->caching_parent && app_ctx->cached_parent.vhd && !app_ctx->keep_versions)
+            eflags |= EXTRACT_F_SCAN_ONLY;
+        extraction_success = extract_stream_fs(app_ctx, stream, output_dir, FS_NTFS, eflags);
 
         if (app_ctx->cached_parent.inner_ntfs &&
             app_ctx->cached_parent.inner_ntfs->stream == stream) {
@@ -1206,7 +1246,7 @@ int lib_main(int argc, char** argv) {
             else if (strcmp(a, "-w") == 0) app_ctx.write_intermediate = true;
             else if (strcmp(a, "-o") == 0 && i + 1 < argc) app_ctx.output_dir = argv[++i];
             else if (strcmp(a, "-p") == 0 && i + 1 < argc) app_ctx.parent_file = argv[++i];
-            else if (strcmp(a, "-k") == 0 || strcmp(a, "--keep") == 0) app_ctx.keep_versions = true;
+            else if (strcmp(a, "-k") == 0) app_ctx.keep_versions = true;
             continue;
         }
         input_files[input_file_count++] = a;
@@ -1215,114 +1255,143 @@ int lib_main(int argc, char** argv) {
     if (input_file_count == 0) { fprintf(stderr, "no files\n"); return 1; }
     if (!key_any()) fprintf(stderr, "no keys\n");
 
+    uint8_t sort_key[256][10]; // game_id(4) + container_type(1) + seq(1) + version(4)
+    for (int i = 0; i < input_file_count; i++) {
+        memset(sort_key[i], 0xFF, 10);
+        FILE* f = FOPEN(input_files[i], "rb");
+        if (!f) continue;
+        uint8_t enc[96];
+        if (fread(enc, 1, 96, f) == 96) {
+            BootId id;
+            decrypt_bootid(enc, &id);
+            memcpy(sort_key[i], id.game_id, 4);
+            sort_key[i][4] = id.container_type;
+            sort_key[i][5] = id.sequence_number;
+            memcpy(sort_key[i] + 6, id.target_version.option, 4);
+        }
+        fclose(f);
+    }
+
     for (int i = 1; i < input_file_count; i++) {
         for (int j = i; j > 0; j--) {
-            if (strcmp(get_basename(input_files[j-1]), get_basename(input_files[j])) > 0) {
-                const char* tmp = input_files[j-1];
-                input_files[j-1] = input_files[j];
-                input_files[j] = tmp;
+            if (memcmp(sort_key[j-1], sort_key[j], 10) > 0) {
+                uint8_t tk[10]; memcpy(tk, sort_key[j-1], 10); memcpy(sort_key[j-1], sort_key[j], 10); memcpy(sort_key[j], tk, 10);
+                const char* tp = input_files[j-1]; input_files[j-1] = input_files[j]; input_files[j] = tp;
             } else break;
         }
     }
 
-    if (!app_ctx.parent_file && input_file_count > 1) {
-        app_ctx.parent_file = input_files[0];
-        for (int i = 0; i < input_file_count - 1; i++)
-            input_files[i] = input_files[i + 1];
-        input_file_count--;
-    }
+    int group_starts[257];
+    int group_count;
 
     if (app_ctx.parent_file) {
-        app_ctx.caching_parent = true;
-        ErrorCode perr = do_file(&app_ctx, app_ctx.parent_file);
-        app_ctx.caching_parent = false;
-        app_ctx.parent_file = NULL;
-
-        if (perr == ERR_OK && app_ctx.write_intermediate &&
-            app_ctx.extract_fs && app_ctx.output_filename) {
-            const char* pbn = get_basename(app_ctx.output_filename);
-            char pbn_no_ext[MAX_PATH_LENGTH];
-            strncpy(pbn_no_ext, pbn, sizeof(pbn_no_ext) - 1);
-            pbn_no_ext[sizeof(pbn_no_ext) - 1] = '\0';
-            strip_extension(pbn_no_ext);
-
-            char parent_out[MAX_PATH_LENGTH];
-            if (app_ctx.output_dir)
-                path_join(parent_out, sizeof(parent_out), app_ctx.output_dir, pbn_no_ext);
-            else {
-                strncpy(parent_out, app_ctx.output_filename, sizeof(parent_out) - 1);
-                parent_out[sizeof(parent_out) - 1] = '\0';
-                strip_extension(parent_out);
-            }
-
-            FsType pfs = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
-            strncpy(app_ctx.cached_parent_output_dir, parent_out, MAX_PATH_LENGTH - 1);
-            app_ctx.cached_parent_output_dir[MAX_PATH_LENGTH - 1] = '\0';
-            app_ctx.caching_parent = true;
-            extract_file_fs(&app_ctx, app_ctx.output_filename, parent_out, pfs,
-                            EXTRACT_F_ALLOW_VHD);
-            app_ctx.caching_parent = false;
-
-            free(app_ctx.output_filename);
-            app_ctx.output_filename = NULL;
+        group_starts[0] = 0;
+        group_starts[1] = input_file_count;
+        group_count = 1;
+    } else {
+        group_starts[0] = 0;
+        group_count = 1;
+        for (int i = 1; i < input_file_count; i++) {
+            if (memcmp(sort_key[i], sort_key[i-1], 5) != 0)
+                group_starts[group_count++] = i;
         }
-
-        if (perr != ERR_OK || !app_ctx.cached_parent.vhd) {
-            fprintf(stderr, "parent failed\n");
-        }
+        group_starts[group_count] = input_file_count;
     }
 
     bool any_failed = false;
-    for (int i = 0; i < input_file_count; ++i) {
-        const char* file_path = input_files[i];
-        if (do_file(&app_ctx, file_path) == ERR_OK) {
-            if (app_ctx.extract_fs && app_ctx.output_filename) {
-                const char* basename = get_basename(app_ctx.output_filename);
+    for (int gi = 0; gi < group_count; gi++) {
+        int gs = group_starts[gi];
+        int ge = group_starts[gi + 1];
+        int ds = gs;
 
-                char basename_no_ext[MAX_PATH_LENGTH];
-                strncpy(basename_no_ext, basename, sizeof(basename_no_ext) - 1);
-                basename_no_ext[sizeof(basename_no_ext) - 1] = '\0';
-                strip_extension(basename_no_ext);
+        const char* parent_path = app_ctx.parent_file;
+        if (!parent_path && ge - gs > 1) {
+            parent_path = input_files[gs];
+            ds = gs + 1;
+        }
 
-                char output_dir[MAX_PATH_LENGTH];
-                if (app_ctx.output_dir) {
-                    path_join(output_dir, sizeof(output_dir), app_ctx.output_dir, basename_no_ext);
-                } else {
-                    strncpy(output_dir, app_ctx.output_filename, sizeof(output_dir) - 1);
-                    output_dir[sizeof(output_dir) - 1] = '\0';
-                    strip_extension(output_dir);
+        if (parent_path) {
+            app_ctx.caching_parent = true;
+            ErrorCode perr = do_file(&app_ctx, parent_path);
+            app_ctx.caching_parent = false;
+            app_ctx.parent_file = NULL;
+
+            if (perr == ERR_OK && app_ctx.write_intermediate &&
+                app_ctx.extract_fs && app_ctx.output_filename) {
+                const char* pbn = get_basename(app_ctx.output_filename);
+                char pbn_no_ext[MAX_PATH_LENGTH];
+                strncpy(pbn_no_ext, pbn, sizeof(pbn_no_ext) - 1);
+                pbn_no_ext[sizeof(pbn_no_ext) - 1] = '\0';
+                strip_extension(pbn_no_ext);
+
+                char parent_out[MAX_PATH_LENGTH];
+                if (app_ctx.output_dir)
+                    path_join(parent_out, sizeof(parent_out), app_ctx.output_dir, pbn_no_ext);
+                else {
+                    strncpy(parent_out, app_ctx.output_filename, sizeof(parent_out) - 1);
+                    parent_out[sizeof(parent_out) - 1] = '\0';
+                    strip_extension(parent_out);
                 }
 
-                FsType fs_type = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
-                extract_file_fs(&app_ctx, app_ctx.output_filename, output_dir, fs_type,
+                FsType pfs = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
+                strncpy(app_ctx.cached_parent_output_dir, parent_out, MAX_PATH_LENGTH - 1);
+                app_ctx.cached_parent_output_dir[MAX_PATH_LENGTH - 1] = '\0';
+                app_ctx.caching_parent = true;
+                extract_file_fs(&app_ctx, app_ctx.output_filename, parent_out, pfs,
                                 EXTRACT_F_ALLOW_VHD);
-
-                if (app_ctx.stacked_to_parent) {
-                    remove_dir_tree(output_dir);
-                    strncpy(app_ctx.stacked_final_name, output_dir, MAX_PATH_LENGTH - 1);
-                    app_ctx.stacked_final_name[MAX_PATH_LENGTH - 1] = '\0';
-                    app_ctx.stacked_to_parent = false;
-                }
+                app_ctx.caching_parent = false;
 
                 free(app_ctx.output_filename);
                 app_ctx.output_filename = NULL;
             }
-        }
-        else {
-            fprintf(stderr, "fail:%s\n", file_path);
-            any_failed = true;
-        }
-    }
 
-    if (app_ctx.cached_parent.vhd) {
-        if (!app_ctx.cached_parent_consumed || app_ctx.keep_versions) {
-            uint64_t vhd_files = 0, vhd_bytes = 0;
-            if (vhd_extract_ntfs(app_ctx.cached_parent.vhd, app_ctx.cached_parent_dir,
-                                 app_ctx.silent, app_ctx.verbose, &vhd_files, &vhd_bytes)) {
-                app_ctx.total_files_extracted += vhd_files;
-                app_ctx.total_bytes_extracted += vhd_bytes;
+            if (perr != ERR_OK || !app_ctx.cached_parent.vhd) {
+                fprintf(stderr, "parent failed\n");
             }
         }
+
+        for (int i = ds; i < ge; i++) {
+            const char* file_path = input_files[i];
+            if (do_file(&app_ctx, file_path) == ERR_OK) {
+                if (app_ctx.extract_fs && app_ctx.output_filename) {
+                    const char* basename = get_basename(app_ctx.output_filename);
+
+                    char basename_no_ext[MAX_PATH_LENGTH];
+                    strncpy(basename_no_ext, basename, sizeof(basename_no_ext) - 1);
+                    basename_no_ext[sizeof(basename_no_ext) - 1] = '\0';
+                    strip_extension(basename_no_ext);
+
+                    char output_dir[MAX_PATH_LENGTH];
+                    if (app_ctx.output_dir) {
+                        path_join(output_dir, sizeof(output_dir), app_ctx.output_dir, basename_no_ext);
+                    } else {
+                        strncpy(output_dir, app_ctx.output_filename, sizeof(output_dir) - 1);
+                        output_dir[sizeof(output_dir) - 1] = '\0';
+                        strip_extension(output_dir);
+                    }
+
+                    FsType fs_type = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
+                    extract_file_fs(&app_ctx, app_ctx.output_filename, output_dir, fs_type,
+                                    EXTRACT_F_ALLOW_VHD);
+
+                    if (app_ctx.stacked_to_parent) {
+                        remove_dir_tree(output_dir);
+                        strncpy(app_ctx.stacked_final_name, output_dir, MAX_PATH_LENGTH - 1);
+                        app_ctx.stacked_final_name[MAX_PATH_LENGTH - 1] = '\0';
+                        app_ctx.stacked_to_parent = false;
+                    }
+
+                    free(app_ctx.output_filename);
+                    app_ctx.output_filename = NULL;
+                }
+            }
+            else {
+                fprintf(stderr, "fail:%s\n", file_path);
+                any_failed = true;
+            }
+        }
+
+        finalize_group(&app_ctx);
     }
 
     if (!app_ctx.silent && app_ctx.total_files_extracted > 0) {
@@ -1335,28 +1404,6 @@ int lib_main(int argc, char** argv) {
 
     if (app_ctx.output_filename) {
         free(app_ctx.output_filename);
-    }
-
-    free_cached_parent(&app_ctx.cached_parent);
-
-    if (app_ctx.stacked_final_name[0] && app_ctx.cached_parent_output_dir[0]) {
-        rename(app_ctx.cached_parent_output_dir, app_ctx.stacked_final_name);
-
-        if (app_ctx.stacked_final_inner[0]) {
-            size_t outer_len = strlen(app_ctx.cached_parent_output_dir);
-            const char* inner_suffix = app_ctx.cached_parent_dir + outer_len;
-
-            char old_inner[MAX_PATH_LENGTH];
-            snprintf(old_inner, sizeof(old_inner), "%s%s",
-                     app_ctx.stacked_final_name, inner_suffix);
-
-            char new_inner[MAX_PATH_LENGTH];
-            path_join(new_inner, sizeof(new_inner),
-                      app_ctx.stacked_final_name, app_ctx.stacked_final_inner);
-
-            if (strcmp(old_inner, new_inner) != 0)
-                rename(old_inner, new_inner);
-        }
     }
 
     return any_failed ? 1 : 0;
