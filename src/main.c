@@ -2,7 +2,6 @@
 #include "bootid.h"
 #include "crypto.h"
 #include "aes.h"
-#include "progress.h"
 #include "exfat.h"
 #include "ntfs.h"
 #include "error.h"
@@ -12,16 +11,38 @@
 #define PAGE_SIZE 4096
 #define BUFFER_SIZE (PAGE_SIZE * 256)
 #define MAX_PATH_LENGTH 256
-#define VERSION "2026020601"
+#ifndef VERSION
+#define VERSION "0000000000"
+#endif
+
+typedef struct {
+    VHDContext* vhd;
+    NTFSContext* inner_ntfs;
+    DecryptStream* inner_stream;
+    RunSource* inner_run_src;
+    NTFSContext* outer_ntfs;
+    DecryptStream* outer_stream;
+    FILE* file;
+    char opt_path[MAX_PATH_LENGTH];
+} CachedParentVHD;
 
 typedef struct {
     bool silent;
     bool verbose;
     bool extract_fs;
     bool write_intermediate;
+    bool keep_versions;
     char* output_filename;
     const char* output_dir;
     const char* parent_file;
+    CachedParentVHD cached_parent;
+    char cached_parent_dir[MAX_PATH_LENGTH];
+    bool cached_parent_consumed;
+    bool caching_parent;
+    bool stacked_to_parent;
+    char cached_parent_output_dir[MAX_PATH_LENGTH];
+    char stacked_final_name[MAX_PATH_LENGTH];
+    char stacked_final_inner[MAX_PATH_LENGTH];
     uint64_t total_files_extracted;
     uint64_t total_bytes_extracted;
     time_t start_time;
@@ -43,12 +64,59 @@ typedef struct {
 #define PRINT(ctx, ...) do { if (!(ctx)->silent) printf(__VA_ARGS__); } while(0)
 #define VERBOSE(ctx, ...) do { if ((ctx)->verbose && !(ctx)->silent) printf(__VA_ARGS__); } while(0)
 
+static inline bool validate_bootid_offsets(const BootId* b, uint64_t* out_offset, uint64_t* out_size) {
+    if (b->header_block_count > b->block_count) return false;
+    if (b->block_size > 0 && b->block_count > ((uint64_t)-1) / b->block_size) return false;
+    *out_offset = b->header_block_count * b->block_size;
+    *out_size = (b->block_count - b->header_block_count) * b->block_size;
+    return true;
+}
+
+static void free_cached_parent(CachedParentVHD* cp) {
+    if (!cp->vhd) return;
+    vhd_close(cp->vhd); free(cp->vhd);
+    if (cp->inner_ntfs) { ntfs_close(cp->inner_ntfs); free(cp->inner_ntfs); }
+    free(cp->inner_stream);
+    free(cp->inner_run_src);
+    if (cp->outer_ntfs) { ntfs_close(cp->outer_ntfs); free(cp->outer_ntfs); }
+    free(cp->outer_stream);
+    if (cp->file) fclose(cp->file);
+    if (cp->opt_path[0]) REMOVE(cp->opt_path);
+    memset(cp, 0, sizeof(*cp));
+}
+
 static inline void path_join(char* dest, size_t size, const char* dir, const char* name) {
     if (dir) {
         snprintf(dest, size, "%s%s%s", dir, PATH_SEPARATOR, name);
     } else {
         snprintf(dest, size, "%s", name);
     }
+}
+
+static void remove_dir_tree(const char* dir_path) {
+    char search[MAX_PATH_LENGTH];
+    snprintf(search, sizeof(search), "%s%s*", dir_path, PATH_SEPARATOR);
+
+    lib_finddata_t fd;
+    intptr_t h = _findfirst(search, &fd);
+    if (h == -1) { RMDIR(dir_path); return; }
+
+    do {
+        if (fd.name[0] == '.' && (fd.name[1] == '\0' ||
+            (fd.name[1] == '.' && fd.name[2] == '\0'))) continue;
+
+        char full[MAX_PATH_LENGTH];
+        path_join(full, sizeof(full), dir_path, fd.name);
+
+        if (fd.attrib & _A_SUBDIR) {
+            remove_dir_tree(full);
+        } else {
+            REMOVE(full);
+        }
+    } while (_findnext(h, &fd) == 0);
+
+    _findclose(h);
+    RMDIR(dir_path);
 }
 
 static ErrorCode do_file(AppContext* app_ctx, const char* path);
@@ -59,17 +127,17 @@ static bool test_keys(FILE* file, uint64_t data_offset, const uint8_t* test_key,
     uint8_t page_iv[16];
     uint8_t decrypted[16];
 
-    long saved_pos = ftell(file);
-    if (fseek(file, (long)data_offset, SEEK_SET) != 0) {
-        fseek(file, saved_pos, SEEK_SET);
+    int64_t saved_pos = FTELLO(file);
+    if (FSEEKO(file, data_offset, SEEK_SET) != 0) {
+        FSEEKO(file, saved_pos, SEEK_SET);
         return false;
     }
 
     if (fread(buffer, 1, 16, file) != 16) {
-        fseek(file, saved_pos, SEEK_SET);
+        FSEEKO(file, saved_pos, SEEK_SET);
         return false;
     }
-    fseek(file, saved_pos, SEEK_SET);
+    FSEEKO(file, saved_pos, SEEK_SET);
 
     iv_page(0, test_iv, page_iv);
 
@@ -112,8 +180,7 @@ static ErrorCode parse_bootid(AppContext* app_ctx, FILE* file, DecryptInfo* info
 
     info->is_apm3 = (info->bootid.container_type == CONTAINER_TYPE_OPTION) && IS_APM3_OPTION(info->bootid.game_id);
     info->is_inner_apm3 = false;
-    info->data_offset = info->bootid.header_block_count * info->bootid.block_size;
-    info->data_size = (info->bootid.block_count - info->bootid.header_block_count) * info->bootid.block_size;
+    if (!validate_bootid_offsets(&info->bootid, &info->data_offset, &info->data_size)) return ERR_INVALID_BOOTID;
 
     const char* id = (info->bootid.container_type == CONTAINER_TYPE_OS) ? info->os_id : info->game_id;
 
@@ -132,8 +199,6 @@ static ErrorCode parse_bootid(AppContext* app_ctx, FILE* file, DecryptInfo* info
         if (got_keys) key_source = keys.external ? "ext" : "int";
     } else if (info->is_apm3) {
         memcpy(keys.key, OPTION_KEY, 16);
-        memcpy(keys.iv, OPTION_IV, 16);
-        keys.has_iv = true;
         got_keys = true;
         key_source = "apm3";
     } else {
@@ -141,14 +206,11 @@ static ErrorCode parse_bootid(AppContext* app_ctx, FILE* file, DecryptInfo* info
         if (key_derive(info->game_id, derived_key, derived_iv) &&
             test_keys(file, info->data_offset, derived_key, derived_iv, NTFS_HEADER)) {
             memcpy(keys.key, derived_key, 16);
-            memcpy(keys.iv, derived_iv, 16);
-            keys.has_iv = true;
             got_keys = true;
             info->is_inner_apm3 = true;
             key_source = "derived";
         } else {
             memcpy(keys.key, OPTION_KEY, 16);
-            keys.has_iv = false;
             got_keys = true;
             key_source = "optkey";
         }
@@ -162,26 +224,16 @@ static ErrorCode parse_bootid(AppContext* app_ctx, FILE* file, DecryptInfo* info
     VERBOSE(app_ctx, "  key:%s\n", key_source);
     memcpy(info->key, keys.key, 16);
 
-    bool has_iv = !info->bootid.use_custom_iv && keys.has_iv;
-    if (has_iv) {
-        memcpy(info->iv, keys.iv, 16);
-        VERBOSE(app_ctx, "  iv:key\n");
-    } else {
-        if (fseek(file, (long)info->data_offset, SEEK_SET) != 0) {
-            FAIL(ERR_FILE_SEEK);
-            return ERR_FILE_SEEK;
-        }
-        if (fread(read_buffer, 1, PAGE_SIZE, file) != PAGE_SIZE) {
-            FAIL(ERR_FILE_READ);
-            return ERR_FILE_READ;
-        }
-        const uint8_t* header = (info->bootid.container_type == CONTAINER_TYPE_OPTION && !info->is_apm3 && !info->is_inner_apm3) ? EXFAT_HEADER : NTFS_HEADER;
-        if (!iv_file(info->key, header, read_buffer, info->iv)) {
-            FAIL(ERR_IV_CALCULATION);
-            return ERR_IV_CALCULATION;
-        }
-        VERBOSE(app_ctx, "  iv:calc\n");
+    if (FSEEKO(file, info->data_offset, SEEK_SET) != 0) {
+        FAIL(ERR_FILE_SEEK);
+        return ERR_FILE_SEEK;
     }
+    if (fread(read_buffer, 1, 16, file) != 16) {
+        FAIL(ERR_FILE_READ);
+        return ERR_FILE_READ;
+    }
+    const uint8_t* header = (info->bootid.container_type == CONTAINER_TYPE_OPTION && !info->is_apm3 && !info->is_inner_apm3) ? EXFAT_HEADER : NTFS_HEADER;
+    iv_file(info->key, header, read_buffer, info->iv);
 
     return ERR_OK;
 }
@@ -229,25 +281,15 @@ static void copy_runs_from_opt(RunSource* dst, const PendingOpt* opt, void* ntfs
     dst->ntfs_ctx = ntfs_ctx;
     dst->run_count = (opt->run_count < MAX_DATA_RUNS) ? opt->run_count : MAX_DATA_RUNS;
     dst->file_size = opt->file_size;
-    for (int r = 0; r < dst->run_count; r++) {
-        dst->runs[r].offset = opt->runs[r].offset;
-        dst->runs[r].length = opt->runs[r].length;
-    }
+    memcpy(dst->runs, opt->runs, dst->run_count * sizeof(DataRun));
 }
 
 #define EXTRACT_F_ALLOW_VHD         0x01
 #define EXTRACT_F_RMDIR_ON_ORPHAN   0x02
-#define EXTRACT_F_CHECK_DIFF_PARENT 0x04
 
 static void strip_extension(char* path) {
     char* ext = strrchr(path, '.');
     if (ext) *ext = '\0';
-}
-
-static const char* get_basename(const char* path) {
-    const char* b = strrchr(path, '/');
-    if (!b) b = strrchr(path, '\\');
-    return b ? b + 1 : path;
 }
 
 static void do_inner_opts(AppContext* app_ctx, const char* dir_path);
@@ -269,7 +311,7 @@ static void process_pending_opts(AppContext* app_ctx, NTFSContext* ctx, const ch
         copy_runs_from_opt(&run_src, opt, ctx);
 
         uint8_t bootid_enc[96];
-        if (!stream_read_raw(ctx, run_src.runs, run_src.run_count,
+        if (!ntfs_read_from_runs(ctx, run_src.runs, run_src.run_count,
                             run_src.file_size, 0, bootid_enc, 96)) {
             fprintf(stderr, "optrd\n");
             continue;
@@ -283,11 +325,11 @@ static void process_pending_opts(AppContext* app_ctx, NTFSContext* ctx, const ch
         memcpy(inner_game_id, inner_bootid.game_id, 4);
         inner_game_id[4] = '\0';
 
-        uint64_t inner_data_offset = inner_bootid.header_block_count * inner_bootid.block_size;
-        uint64_t inner_data_size = (inner_bootid.block_count - inner_bootid.header_block_count) * inner_bootid.block_size;
+        uint64_t inner_data_offset, inner_data_size;
+        if (!validate_bootid_offsets(&inner_bootid, &inner_data_offset, &inner_data_size)) continue;
 
         uint8_t first_page[PAGE_SIZE];
-        if (!stream_read_raw(ctx, run_src.runs, run_src.run_count,
+        if (!ntfs_read_from_runs(ctx, run_src.runs, run_src.run_count,
                             run_src.file_size, inner_data_offset, first_page, PAGE_SIZE)) {
             fprintf(stderr, "pgrd\n");
             continue;
@@ -328,20 +370,15 @@ static void process_pending_opts(AppContext* app_ctx, NTFSContext* ctx, const ch
         extract_stream_fs(app_ctx, inner_stream, inner_output_dir, inner_fs,
                           EXTRACT_F_ALLOW_VHD | EXTRACT_F_RMDIR_ON_ORPHAN);
 
-        free(inner_run_src);
-        free(inner_stream);
+        if (app_ctx->cached_parent.inner_ntfs &&
+            app_ctx->cached_parent.inner_ntfs->stream == inner_stream) {
+            app_ctx->cached_parent.inner_stream = inner_stream;
+            app_ctx->cached_parent.inner_run_src = inner_run_src;
+        } else {
+            free(inner_run_src);
+            free(inner_stream);
+        }
     }
-}
-
-static int find_highest_vhd(const char* dir) {
-    char vhd_path[MAX_PATH_LENGTH];
-    int highest = -1;
-    for (int n = 0; n < 10; n++) {
-        snprintf(vhd_path, sizeof(vhd_path), "%s%sinternal_%d.vhd", dir, PATH_SEPARATOR, n);
-        FILE* f = FOPEN(vhd_path, "rb");
-        if (f) { fclose(f); highest = n; }
-    }
-    return highest;
 }
 
 static bool extract_file_fs(AppContext* app_ctx, const char* filepath,
@@ -349,30 +386,22 @@ static bool extract_file_fs(AppContext* app_ctx, const char* filepath,
     bool ok = false;
 
     if (fs_type == FS_NTFS) {
-        NTFSContext ctx = {0};
-        ctx.silent = app_ctx->silent;
-        ctx.verbose = app_ctx->verbose;
+        NTFSContext* ctx = calloc(1, sizeof(NTFSContext));
+        if (!ctx) return false;
+        ctx->silent = app_ctx->silent;
+        ctx->verbose = app_ctx->verbose;
 
-        if (ntfs_init(&ctx, filepath, out_dir)) {
-            if (flags & EXTRACT_F_CHECK_DIFF_PARENT) {
-                int vhd_type = ntfs_detect_vhd_type(&ctx);
-                if (vhd_type == VHD_TYPE_DIFFERENCING && !app_ctx->parent_file) {
-                    PRINT(app_ctx, "\ndiff VHD, use -p\n");
-                    ntfs_close(&ctx);
-                    return true;
-                }
-            }
-
+        if (ntfs_init(ctx, filepath, out_dir)) {
             VERBOSE(app_ctx, "ntfs MFT=%llu c=%u\n",
-                (unsigned long long)ctx.total_mft_records, ctx.bytes_per_cluster);
+                (unsigned long long)ctx->total_mft_records, ctx->bytes_per_cluster);
 
-            if (ntfs_extract_all(&ctx)) {
+            if (ntfs_extract_all(ctx)) {
                 ok = true;
-                app_ctx->total_files_extracted += ctx.files_extracted;
-                app_ctx->total_bytes_extracted += ctx.extracted_bytes;
+                app_ctx->total_files_extracted += ctx->files_extracted;
+                app_ctx->total_bytes_extracted += ctx->extracted_bytes;
 
                 if (flags & EXTRACT_F_ALLOW_VHD) {
-                    int highest = find_highest_vhd(out_dir);
+                    int highest = ctx->highest_extracted_vhd;
                     if (highest >= 0) {
                         char vhd_path[MAX_PATH_LENGTH];
                         snprintf(vhd_path, sizeof(vhd_path), "%s%sinternal_%d.vhd",
@@ -381,26 +410,67 @@ static bool extract_file_fs(AppContext* app_ctx, const char* filepath,
                         char vhd_out[MAX_PATH_LENGTH];
                         snprintf(vhd_out, sizeof(vhd_out), "%s%scontents", out_dir, PATH_SEPARATOR);
 
-                        NTFSContext vhd_ctx = {0};
-                        vhd_ctx.silent = app_ctx->silent;
-                        vhd_ctx.verbose = app_ctx->verbose;
-
-                        if (ntfs_init(&vhd_ctx, vhd_path, vhd_out)) {
-                            VERBOSE(app_ctx, "vhd MFT=%llu c=%u\n",
-                                (unsigned long long)vhd_ctx.total_mft_records, vhd_ctx.bytes_per_cluster);
-                            if (ntfs_extract_all(&vhd_ctx)) {
-                                app_ctx->total_files_extracted += vhd_ctx.files_extracted;
-                                app_ctx->total_bytes_extracted += vhd_ctx.extracted_bytes;
+                        bool cached = false;
+                        if (app_ctx->caching_parent) {
+                            VHDContext* base = malloc(sizeof(VHDContext));
+                            if (base) {
+                                if (vhd_init_internal(base, vhd_path, 0) &&
+                                    base->footer.disk_type == VHD_TYPE_DYNAMIC) {
+                                    free_cached_parent(&app_ctx->cached_parent);
+                                    app_ctx->cached_parent.vhd = base;
+                                    strncpy(app_ctx->cached_parent_dir, vhd_out, MAX_PATH_LENGTH - 1);
+                                    app_ctx->cached_parent_dir[MAX_PATH_LENGTH - 1] = '\0';
+                                    app_ctx->cached_parent_consumed = false;
+                                    cached = true;
+                                } else {
+                                    vhd_close(base); free(base);
+                                }
                             }
-                            ntfs_close(&vhd_ctx);
+                        }
+
+                        if (!cached) {
+                            NTFSContext* vhd_ctx = calloc(1, sizeof(NTFSContext));
+                            if (vhd_ctx) {
+                                vhd_ctx->silent = app_ctx->silent;
+                                vhd_ctx->verbose = app_ctx->verbose;
+
+                                VHDContext* pv = app_ctx->cached_parent.vhd;
+                                const char* vhd_target = (pv && !app_ctx->keep_versions) ? app_ctx->cached_parent_dir : vhd_out;
+                                bool init_ok = pv ?
+                                    ntfs_init_vhd(vhd_ctx, vhd_path, vhd_target, pv) :
+                                    ntfs_init(vhd_ctx, vhd_path, vhd_target);
+                                bool used_cached = init_ok && pv && vhd_ctx->vhd.parent == pv;
+
+                                if (init_ok) {
+                                    VERBOSE(app_ctx, "vhd MFT=%llu c=%u\n",
+                                        (unsigned long long)vhd_ctx->total_mft_records, vhd_ctx->bytes_per_cluster);
+                                    if (ntfs_extract_all(vhd_ctx)) {
+                                        app_ctx->total_files_extracted += vhd_ctx->files_extracted;
+                                        app_ctx->total_bytes_extracted += vhd_ctx->extracted_bytes;
+                                    }
+                                    if (used_cached) {
+                                        vhd_ctx->vhd.parent = NULL;
+                                        app_ctx->cached_parent_consumed = true;
+                                        if (!app_ctx->keep_versions) {
+                                            app_ctx->stacked_to_parent = true;
+                                            const char* ibn = get_basename(out_dir);
+                                            strncpy(app_ctx->stacked_final_inner, ibn, MAX_PATH_LENGTH - 1);
+                                            app_ctx->stacked_final_inner[MAX_PATH_LENGTH - 1] = '\0';
+                                        }
+                                    }
+                                    ntfs_close(vhd_ctx);
+                                }
+                                free(vhd_ctx);
+                            }
                         }
                     }
                 }
 
                 do_inner_opts(app_ctx, out_dir);
             }
-            ntfs_close(&ctx);
+            ntfs_close(ctx);
         }
+        free(ctx);
     } else {
         ExfatContext ctx;
         if (exfat_init(&ctx, filepath)) {
@@ -440,9 +510,7 @@ static bool derive_inner_keys(const char* game_id, const uint8_t* first_page,
     }
 
     memcpy(out_key, OPTION_KEY, 16);
-    if (!iv_file(out_key, EXFAT_HEADER, first_page, out_iv)) {
-        return false;
-    }
+    iv_file(out_key, EXFAT_HEADER, first_page, out_iv);
     *out_fs = FS_EXFAT;
     return true;
 }
@@ -452,43 +520,75 @@ static bool extract_stream_fs(AppContext* app_ctx, DecryptStream* stream,
     bool ok = false;
 
     if (fs_type == FS_NTFS) {
-        NTFSContext ctx = {0};
-        ctx.silent = app_ctx->silent;
-        ctx.verbose = app_ctx->verbose;
+        NTFSContext* ctx = calloc(1, sizeof(NTFSContext));
+        if (!ctx) return false;
+        ctx->silent = app_ctx->silent;
+        ctx->verbose = app_ctx->verbose;
 
-        if (ntfs_init_stream(&ctx, stream, out_dir)) {
-            if (flags & EXTRACT_F_CHECK_DIFF_PARENT) {
-                int vhd_type = ntfs_detect_vhd_type(&ctx);
-                if (vhd_type == VHD_TYPE_DIFFERENCING && !app_ctx->parent_file) {
-                    PRINT(app_ctx, "diff VHD, use -p\n");
-                    ntfs_close(&ctx);
-                    return true;
-                }
-            }
-
+        if (ntfs_init_stream(ctx, stream, out_dir)) {
             VERBOSE(app_ctx, "MFT=%llu c=%u\n",
-                (unsigned long long)ctx.total_mft_records, ctx.bytes_per_cluster);
+                (unsigned long long)ctx->total_mft_records, ctx->bytes_per_cluster);
 
-            ctx.silent = true;
-            if (ntfs_extract_all(&ctx)) {
-                ctx.silent = app_ctx->silent;
+            ctx->silent = true;
+            if (ntfs_extract_all(ctx)) {
+                ctx->silent = app_ctx->silent;
+
+                uint64_t saved_files = ctx->files_extracted;
+                uint64_t saved_bytes = ctx->extracted_bytes;
 
                 bool is_orphan = false;
-                if ((flags & EXTRACT_F_ALLOW_VHD) && ctx.pending_vhd_count > 0) {
-                    ntfs_extract_pending_vhds(&ctx, app_ctx->silent, app_ctx->verbose, &is_orphan);
+                if ((flags & EXTRACT_F_ALLOW_VHD) && ctx->pending_vhd_count > 0) {
+                    VHDContext* base_vhd = NULL;
+                    VHDContext* pv = app_ctx->cached_parent.vhd;
+                    bool want_cache = app_ctx->caching_parent && !pv;
+
+                    if (pv && !app_ctx->keep_versions) {
+                        strncpy(ctx->base_path, app_ctx->cached_parent_dir,
+                                sizeof(ctx->base_path) - 1);
+                        ctx->base_path[sizeof(ctx->base_path) - 1] = '\0';
+                    }
+
+                    ntfs_extract_pending_vhds(ctx, app_ctx->silent, app_ctx->verbose,
+                        app_ctx->parent_file, pv,
+                        &is_orphan, want_cache ? &base_vhd : NULL);
+
+                    if (base_vhd) {
+                        free_cached_parent(&app_ctx->cached_parent);
+                        base_vhd->run_source->ntfs_ctx = ctx;
+                        app_ctx->cached_parent.vhd = base_vhd;
+                        app_ctx->cached_parent.inner_ntfs = ctx;
+                        strncpy(app_ctx->cached_parent_dir, out_dir, MAX_PATH_LENGTH - 1);
+                        app_ctx->cached_parent_dir[MAX_PATH_LENGTH - 1] = '\0';
+                        app_ctx->cached_parent_consumed = false;
+                        ctx = NULL;
+                    }
+
+                    if (pv && !is_orphan) {
+                        app_ctx->cached_parent_consumed = true;
+                        if (!app_ctx->keep_versions) {
+                            app_ctx->stacked_to_parent = true;
+                            const char* ibn = get_basename(out_dir);
+                            strncpy(app_ctx->stacked_final_inner, ibn, MAX_PATH_LENGTH - 1);
+                            app_ctx->stacked_final_inner[MAX_PATH_LENGTH - 1] = '\0';
+                        }
+                    }
                 }
 
                 if ((flags & EXTRACT_F_RMDIR_ON_ORPHAN) && is_orphan) {
-                    VERBOSE(app_ctx, "  orphan\n");
+                    PRINT(app_ctx, "  orphan, use -p\n");
                     RMDIR(out_dir);
                 } else {
                     ok = true;
-                    app_ctx->total_files_extracted += ctx.files_extracted;
-                    app_ctx->total_bytes_extracted += ctx.extracted_bytes;
+                    app_ctx->total_files_extracted += saved_files;
+                    app_ctx->total_bytes_extracted += saved_bytes;
                 }
+
+                if (ctx) ntfs_close(ctx);
+            } else {
+                ntfs_close(ctx);
             }
-            ntfs_close(&ctx);
         }
+        free(ctx);
     } else {
         ExfatContext ctx;
         if (exfat_init_stream(&ctx, stream)) {
@@ -550,11 +650,14 @@ static bool do_inner_opt(AppContext* app_ctx, const char* opt_path, const char* 
     memcpy(inner_game_id, bootid.game_id, 4);
     inner_game_id[4] = '\0';
 
-    uint64_t data_offset = bootid.header_block_count * bootid.block_size;
-    uint64_t data_size = (bootid.block_count - bootid.header_block_count) * bootid.block_size;
+    uint64_t data_offset, data_size;
+    if (!validate_bootid_offsets(&bootid, &data_offset, &data_size)) {
+        fclose(file);
+        return false;
+    }
 
     uint8_t first_page[PAGE_SIZE];
-    if (fseek(file, (long)data_offset, SEEK_SET) != 0 ||
+    if (FSEEKO(file, data_offset, SEEK_SET) != 0 ||
         fread(first_page, 1, PAGE_SIZE, file) != PAGE_SIZE) {
         fclose(file);
         return false;
@@ -582,8 +685,16 @@ static bool do_inner_opt(AppContext* app_ctx, const char* opt_path, const char* 
     bool success = extract_stream_fs(app_ctx, stream, output_dir, fs_type,
                                      EXTRACT_F_ALLOW_VHD | EXTRACT_F_RMDIR_ON_ORPHAN);
 
-    free(stream);
-    fclose(file);
+    if (app_ctx->cached_parent.inner_ntfs &&
+        app_ctx->cached_parent.inner_ntfs->stream == stream) {
+        app_ctx->cached_parent.inner_stream = stream;
+        app_ctx->cached_parent.file = file;
+        strncpy(app_ctx->cached_parent.opt_path, opt_path, MAX_PATH_LENGTH - 1);
+        app_ctx->cached_parent.opt_path[MAX_PATH_LENGTH - 1] = '\0';
+    } else {
+        free(stream);
+        fclose(file);
+    }
     return success;
 }
 
@@ -682,7 +793,7 @@ ErrorCode do_file(AppContext* app_ctx, const char* path) {
         goto cleanup;
     }
 
-    if (fseek(file, (long)info.data_offset, SEEK_SET) != 0) {
+    if (FSEEKO(file, info.data_offset, SEEK_SET) != 0) {
         FAIL(ERR_FILE_SEEK);
         result = ERR_FILE_SEEK;
         goto cleanup;
@@ -690,11 +801,6 @@ ErrorCode do_file(AppContext* app_ctx, const char* path) {
 
     AES_ctx page_ctx;
     AES_init_ctx_iv(&page_ctx, info.key, info.iv);
-
-    Progress progress;
-    if (!app_ctx->silent) {
-        progress_init(&progress, info.data_size);
-    }
 
     uint64_t total_bytes_read = 0;
     uint64_t bytes_remaining = info.data_size;
@@ -732,14 +838,8 @@ ErrorCode do_file(AppContext* app_ctx, const char* path) {
         total_bytes_read += read_size;
         bytes_remaining -= read_size;
 
-        if (!app_ctx->silent) {
-            progress_update(&progress, total_bytes_read);
-        }
     }
 
-    if (!app_ctx->silent) {
-        progress_finish(&progress);
-    }
     PRINT(app_ctx, "ok: %s\n", output_filename);
 
     if (app_ctx->extract_fs) {
@@ -795,6 +895,11 @@ static ErrorCode do_stream(AppContext* app_ctx, const char* path) {
     format_basename(&info, basename_no_ext, sizeof(basename_no_ext));
     path_join(output_dir, sizeof(output_dir), app_ctx->output_dir, basename_no_ext);
 
+    if (app_ctx->caching_parent) {
+        strncpy(app_ctx->cached_parent_output_dir, output_dir, MAX_PATH_LENGTH - 1);
+        app_ctx->cached_parent_output_dir[MAX_PATH_LENGTH - 1] = '\0';
+    }
+
     bool extraction_success = false;
 
     if (info.bootid.container_type == CONTAINER_TYPE_OPTION && !info.is_apm3 && !info.is_inner_apm3) {
@@ -810,58 +915,92 @@ static ErrorCode do_stream(AppContext* app_ctx, const char* path) {
         inner_game_id[4] = '\0';
         VERBOSE(app_ctx, "apm3:%s\n", inner_game_id);
 
-        NTFSContext ctx = { 0 };
-        ctx.silent = app_ctx->silent;
-        ctx.verbose = app_ctx->verbose;
-        ctx.apm3_decrypt = false;
+        NTFSContext* ctx = calloc(1, sizeof(NTFSContext));
+        if (ctx) {
+        ctx->silent = app_ctx->silent;
+        ctx->verbose = app_ctx->verbose;
 
-        if (ntfs_init_stream(&ctx, stream, output_dir)) {
-            int vhd_type = ntfs_detect_vhd_type(&ctx);
-            if (vhd_type == VHD_TYPE_DIFFERENCING && !app_ctx->parent_file) {
-                PRINT(app_ctx, "diff VHD, use -p\n");
-                ntfs_close(&ctx);
-                result = ERR_OK;
-                goto cleanup;
-            }
-
+        if (ntfs_init_stream(ctx, stream, output_dir)) {
             VERBOSE(app_ctx, "MFT=%llu c=%u\n",
-                (unsigned long long)ctx.total_mft_records, ctx.bytes_per_cluster);
+                (unsigned long long)ctx->total_mft_records, ctx->bytes_per_cluster);
 
-            ctx.silent = true;
+            ctx->silent = true;
 
-            if (ntfs_extract_all(&ctx)) {
+            if (ntfs_extract_all(ctx)) {
                 extraction_success = true;
-                ctx.silent = app_ctx->silent;
+                ctx->silent = app_ctx->silent;
 
-                if (ctx.pending_vhd_count > 0) {
+                if (ctx->pending_vhd_count > 0) {
+                    if (app_ctx->cached_parent.vhd && !app_ctx->keep_versions) {
+                        strncpy(ctx->base_path, app_ctx->cached_parent_dir,
+                                sizeof(ctx->base_path) - 1);
+                        ctx->base_path[sizeof(ctx->base_path) - 1] = '\0';
+                    }
+
                     bool is_orphan = false;
-                    ntfs_extract_pending_vhds(&ctx, app_ctx->silent, app_ctx->verbose, &is_orphan);
+                    ntfs_extract_pending_vhds(ctx, app_ctx->silent, app_ctx->verbose,
+                        app_ctx->parent_file, app_ctx->cached_parent.vhd,
+                        &is_orphan, NULL);
+                    if (app_ctx->cached_parent.vhd && !is_orphan) {
+                        app_ctx->cached_parent_consumed = true;
+                        if (!app_ctx->keep_versions)
+                            app_ctx->stacked_to_parent = true;
+                    }
+                    if (is_orphan) {
+                        PRINT(app_ctx, "  orphan, use -p\n");
+                    }
                 }
 
-                app_ctx->total_files_extracted += ctx.files_extracted;
-                app_ctx->total_bytes_extracted += ctx.extracted_bytes;
+                app_ctx->total_files_extracted += ctx->files_extracted;
+                app_ctx->total_bytes_extracted += ctx->extracted_bytes;
 
-                if (info.is_apm3 && ctx.pending_opt_count > 0) {
-                    process_pending_opts(app_ctx, &ctx, output_dir);
+                if (info.is_apm3 && ctx->pending_opt_count > 0) {
+                    process_pending_opts(app_ctx, ctx, output_dir);
                 }
 
-                ntfs_close(&ctx);
+                if (app_ctx->cached_parent.inner_run_src &&
+                    app_ctx->cached_parent.inner_run_src->ntfs_ctx == ctx) {
+                    app_ctx->cached_parent.outer_ntfs = ctx;
+                    app_ctx->cached_parent.outer_stream = stream;
+                    app_ctx->cached_parent.file = file;
+                    stream = NULL;
+                    file = NULL;
+                    ctx = NULL;
+                } else {
+                    ntfs_close(ctx);
+                }
             }
             else {
                 fprintf(stderr, "ntfs\n");
-                ntfs_close(&ctx);
+                ntfs_close(ctx);
             }
         }
         else {
             fprintf(stderr, "ntfsi\n");
         }
+        free(ctx);
+        }
     }
     else {
         extraction_success = extract_stream_fs(app_ctx, stream, output_dir, FS_NTFS,
-                                               EXTRACT_F_ALLOW_VHD | EXTRACT_F_CHECK_DIFF_PARENT);
+                                               EXTRACT_F_ALLOW_VHD);
+
+        if (app_ctx->cached_parent.inner_ntfs &&
+            app_ctx->cached_parent.inner_ntfs->stream == stream) {
+            app_ctx->cached_parent.inner_stream = stream;
+            app_ctx->cached_parent.file = file;
+            stream = NULL;
+            file = NULL;
+        }
     }
 
     if (extraction_success) {
+        if (app_ctx->stacked_to_parent) {
+            remove_dir_tree(output_dir);
+            strncpy(app_ctx->stacked_final_name, output_dir, MAX_PATH_LENGTH - 1);
+            app_ctx->stacked_final_name[MAX_PATH_LENGTH - 1] = '\0';
+            app_ctx->stacked_to_parent = false;
+        }
         result = ERR_OK;
     }
 
@@ -908,7 +1047,6 @@ static bool get_parent_process_name(WCHAR* out_name, size_t max_chars) {
     ULONG buf_size = 1024 * 1024;
     uint8_t* buf = NULL;
 
-    #define STATUS_INFO_LENGTH_MISMATCH ((NTSTATUS)0xC0000004L)
     for (int attempt = 0; attempt < 3; attempt++) {
         buf = lib_malloc(buf_size);
         if (!buf) return false;
@@ -1006,12 +1144,8 @@ static bool from_explorer(void) {
 #endif
 
 static void show_usage(void) {
-    puts("unsegaREBORN [flags] <files>\n-o dir -n -w -p parent -s -v -vn");
+    puts("unsegaREBORN [flags] <files>\n-o dir -n -w -p parent -k -s -v -vn");
 }
-
-#ifdef PLATFORM_WINDOWS
-__declspec(dllimport) NTSTATUS __stdcall NtDelayExecution(uint8_t Alertable, LARGE_INTEGER* DelayInterval);
-#endif
 
 static void wait_for_enter(void) {
 #ifdef PLATFORM_WINDOWS
@@ -1072,6 +1206,7 @@ int lib_main(int argc, char** argv) {
             else if (strcmp(a, "-w") == 0) app_ctx.write_intermediate = true;
             else if (strcmp(a, "-o") == 0 && i + 1 < argc) app_ctx.output_dir = argv[++i];
             else if (strcmp(a, "-p") == 0 && i + 1 < argc) app_ctx.parent_file = argv[++i];
+            else if (strcmp(a, "-k") == 0 || strcmp(a, "--keep") == 0) app_ctx.keep_versions = true;
             continue;
         }
         input_files[input_file_count++] = a;
@@ -1079,6 +1214,63 @@ int lib_main(int argc, char** argv) {
 
     if (input_file_count == 0) { fprintf(stderr, "no files\n"); return 1; }
     if (!key_any()) fprintf(stderr, "no keys\n");
+
+    for (int i = 1; i < input_file_count; i++) {
+        for (int j = i; j > 0; j--) {
+            if (strcmp(get_basename(input_files[j-1]), get_basename(input_files[j])) > 0) {
+                const char* tmp = input_files[j-1];
+                input_files[j-1] = input_files[j];
+                input_files[j] = tmp;
+            } else break;
+        }
+    }
+
+    if (!app_ctx.parent_file && input_file_count > 1) {
+        app_ctx.parent_file = input_files[0];
+        for (int i = 0; i < input_file_count - 1; i++)
+            input_files[i] = input_files[i + 1];
+        input_file_count--;
+    }
+
+    if (app_ctx.parent_file) {
+        app_ctx.caching_parent = true;
+        ErrorCode perr = do_file(&app_ctx, app_ctx.parent_file);
+        app_ctx.caching_parent = false;
+        app_ctx.parent_file = NULL;
+
+        if (perr == ERR_OK && app_ctx.write_intermediate &&
+            app_ctx.extract_fs && app_ctx.output_filename) {
+            const char* pbn = get_basename(app_ctx.output_filename);
+            char pbn_no_ext[MAX_PATH_LENGTH];
+            strncpy(pbn_no_ext, pbn, sizeof(pbn_no_ext) - 1);
+            pbn_no_ext[sizeof(pbn_no_ext) - 1] = '\0';
+            strip_extension(pbn_no_ext);
+
+            char parent_out[MAX_PATH_LENGTH];
+            if (app_ctx.output_dir)
+                path_join(parent_out, sizeof(parent_out), app_ctx.output_dir, pbn_no_ext);
+            else {
+                strncpy(parent_out, app_ctx.output_filename, sizeof(parent_out) - 1);
+                parent_out[sizeof(parent_out) - 1] = '\0';
+                strip_extension(parent_out);
+            }
+
+            FsType pfs = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
+            strncpy(app_ctx.cached_parent_output_dir, parent_out, MAX_PATH_LENGTH - 1);
+            app_ctx.cached_parent_output_dir[MAX_PATH_LENGTH - 1] = '\0';
+            app_ctx.caching_parent = true;
+            extract_file_fs(&app_ctx, app_ctx.output_filename, parent_out, pfs,
+                            EXTRACT_F_ALLOW_VHD);
+            app_ctx.caching_parent = false;
+
+            free(app_ctx.output_filename);
+            app_ctx.output_filename = NULL;
+        }
+
+        if (perr != ERR_OK || !app_ctx.cached_parent.vhd) {
+            fprintf(stderr, "parent failed\n");
+        }
+    }
 
     bool any_failed = false;
     for (int i = 0; i < input_file_count; ++i) {
@@ -1103,7 +1295,14 @@ int lib_main(int argc, char** argv) {
 
                 FsType fs_type = strstr(app_ctx.output_filename, ".exfat") ? FS_EXFAT : FS_NTFS;
                 extract_file_fs(&app_ctx, app_ctx.output_filename, output_dir, fs_type,
-                                EXTRACT_F_ALLOW_VHD | EXTRACT_F_CHECK_DIFF_PARENT);
+                                EXTRACT_F_ALLOW_VHD);
+
+                if (app_ctx.stacked_to_parent) {
+                    remove_dir_tree(output_dir);
+                    strncpy(app_ctx.stacked_final_name, output_dir, MAX_PATH_LENGTH - 1);
+                    app_ctx.stacked_final_name[MAX_PATH_LENGTH - 1] = '\0';
+                    app_ctx.stacked_to_parent = false;
+                }
 
                 free(app_ctx.output_filename);
                 app_ctx.output_filename = NULL;
@@ -1112,6 +1311,17 @@ int lib_main(int argc, char** argv) {
         else {
             fprintf(stderr, "fail:%s\n", file_path);
             any_failed = true;
+        }
+    }
+
+    if (app_ctx.cached_parent.vhd) {
+        if (!app_ctx.cached_parent_consumed || app_ctx.keep_versions) {
+            uint64_t vhd_files = 0, vhd_bytes = 0;
+            if (vhd_extract_ntfs(app_ctx.cached_parent.vhd, app_ctx.cached_parent_dir,
+                                 app_ctx.silent, app_ctx.verbose, &vhd_files, &vhd_bytes)) {
+                app_ctx.total_files_extracted += vhd_files;
+                app_ctx.total_bytes_extracted += vhd_bytes;
+            }
         }
     }
 
@@ -1125,6 +1335,28 @@ int lib_main(int argc, char** argv) {
 
     if (app_ctx.output_filename) {
         free(app_ctx.output_filename);
+    }
+
+    free_cached_parent(&app_ctx.cached_parent);
+
+    if (app_ctx.stacked_final_name[0] && app_ctx.cached_parent_output_dir[0]) {
+        rename(app_ctx.cached_parent_output_dir, app_ctx.stacked_final_name);
+
+        if (app_ctx.stacked_final_inner[0]) {
+            size_t outer_len = strlen(app_ctx.cached_parent_output_dir);
+            const char* inner_suffix = app_ctx.cached_parent_dir + outer_len;
+
+            char old_inner[MAX_PATH_LENGTH];
+            snprintf(old_inner, sizeof(old_inner), "%s%s",
+                     app_ctx.stacked_final_name, inner_suffix);
+
+            char new_inner[MAX_PATH_LENGTH];
+            path_join(new_inner, sizeof(new_inner),
+                      app_ctx.stacked_final_name, app_ctx.stacked_final_inner);
+
+            if (strcmp(old_inner, new_inner) != 0)
+                rename(old_inner, new_inner);
+        }
     }
 
     return any_failed ? 1 : 0;

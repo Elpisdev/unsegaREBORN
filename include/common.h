@@ -9,25 +9,7 @@
 #ifdef PLATFORM_WINDOWS
 
 static inline int utf8_to_wide(const char* utf8, WCHAR* wide, int wide_len) {
-    if (!utf8 || !wide || wide_len <= 0) return 0;
-    int out = 0;
-    const unsigned char* s = (const unsigned char*)utf8;
-    while (*s && out < wide_len - 1) {
-        uint32_t cp;
-        if (s[0] < 0x80) { cp = s[0]; s += 1; }
-        else if ((s[0] & 0xE0) == 0xC0 && (s[1] & 0xC0) == 0x80) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); s += 2; }
-        else if ((s[0] & 0xF0) == 0xE0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); s += 3; }
-        else if ((s[0] & 0xF8) == 0xF0 && (s[1] & 0xC0) == 0x80 && (s[2] & 0xC0) == 0x80 && (s[3] & 0xC0) == 0x80) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); s += 4; }
-        else { cp = '?'; s += 1; }
-        if (cp <= 0xFFFF) wide[out++] = (WCHAR)cp;
-        else if (cp <= 0x10FFFF && out < wide_len - 2) { cp -= 0x10000; wide[out++] = (WCHAR)(0xD800 | (cp >> 10)); wide[out++] = (WCHAR)(0xDC00 | (cp & 0x3FF)); }
-    }
-    wide[out] = 0;
-    return out;
-}
-
-static inline FILE* fopen_utf8(const char* path, const char* mode) {
-    return fopen(path, mode);
+    return (int)utf8_to_utf16(utf8, wide, (size_t)wide_len);
 }
 
 static inline FILE* fopen_prealloc_utf8(const char* path, uint64_t size) {
@@ -48,7 +30,26 @@ static inline int remove_utf8(const char* path) {
     return _wremove(wpath);
 }
 
-#define FOPEN fopen_utf8
+typedef HANDLE DirHandle;
+#define INVALID_DIR_HANDLE INVALID_HANDLE_VALUE
+
+static inline DirHandle open_output_dir(const char* path) {
+    WCHAR wpath[1024];
+    if (!utf8_to_wide(path, wpath, 1024)) return INVALID_DIR_HANDLE;
+    return lib_open_dir_handle(wpath);
+}
+
+static inline FILE* fopen_in_dir(DirHandle dir, const char* filename, uint64_t prealloc_size) {
+    WCHAR wname[256];
+    if (!utf8_to_wide(filename, wname, 256)) return NULL;
+    return lib_fopen_relative(dir, wname, prealloc_size);
+}
+
+static inline void close_output_dir(DirHandle dir) {
+    if (dir != INVALID_DIR_HANDLE) NtClose(dir);
+}
+
+#define FOPEN fopen
 #define FOPEN_PREALLOC fopen_prealloc_utf8
 #define FWRITE_DIRECT lib_fwrite_direct
 #define MKDIR(path) mkdir_utf8(path)
@@ -58,21 +59,13 @@ static inline int remove_utf8(const char* path) {
 static inline bool set_file_times(const char* path, uint64_t modified_time, uint64_t access_time) {
     WCHAR wpath[1024];
     if (!utf8_to_wide(path, wpath, 1024)) return false;
-
-    struct { int64_t actime; int64_t modtime; } times;
-    times.modtime = (int64_t)((modified_time / 10000000ULL) - 11644473600ULL);
-    times.actime = (int64_t)((access_time / 10000000ULL) - 11644473600ULL);
-    return _wutime(wpath, &times) == 0;
+    return lib_wutime(wpath, (int64_t)modified_time, (int64_t)access_time) == 0;
 }
 
 static inline bool set_dir_times(const char* path, uint64_t modified_time, uint64_t access_time) {
     WCHAR wpath[1024];
     if (!utf8_to_wide(path, wpath, 1024)) return false;
-
-    struct { int64_t actime; int64_t modtime; } times;
-    times.modtime = (int64_t)((modified_time / 10000000ULL) - 11644473600ULL);
-    times.actime = (int64_t)((access_time / 10000000ULL) - 11644473600ULL);
-    return lib_wutime_dir(wpath, &times) == 0;
+    return lib_wutime_dir(wpath, (int64_t)modified_time, (int64_t)access_time) == 0;
 }
 
 static inline bool set_file_times_handle(FILE* f, uint64_t modified_time, uint64_t access_time) {
@@ -80,6 +73,14 @@ static inline bool set_file_times_handle(FILE* f, uint64_t modified_time, uint64
 }
 
 #else
+
+typedef int DirHandle;
+#define INVALID_DIR_HANDLE (-1)
+static inline DirHandle open_output_dir(const char* path) { (void)path; return -1; }
+static inline FILE* fopen_in_dir(DirHandle dir, const char* filename, uint64_t prealloc_size) {
+    (void)dir; (void)filename; (void)prealloc_size; return NULL;
+}
+static inline void close_output_dir(DirHandle dir) { (void)dir; }
 
 #define FOPEN fopen
 #define FOPEN_PREALLOC(path, size) fopen(path, "wb")
@@ -118,9 +119,8 @@ static inline uint64_t exfat_timestamp_to_ntfs(uint32_t exfat_ts, uint8_t centis
     uint32_t month = (exfat_ts >> 21) & 0x0F;
     uint32_t year = ((exfat_ts >> 25) & 0x7F) + 1980;
 
-    uint64_t days = 0;
-    for (uint32_t y = 1601; y < year; y++)
-        days += (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0)) ? 366 : 365;
+    uint32_t py = year - 1;
+    uint64_t days = (uint64_t)py * 365 + py / 4 - py / 100 + py / 400 - 584388ULL;
     static const uint16_t month_days[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
     if (month >= 1 && month <= 12) {
         days += month_days[month - 1];
@@ -148,23 +148,31 @@ static inline uint64_t exfat_timestamp_to_ntfs(uint32_t exfat_ts, uint8_t centis
 #endif
 
 static inline size_t utf16_to_utf8_common(const uint16_t* utf16, int utf16_len, char* utf8, size_t utf8_size) {
-    size_t out_pos = 0;
-    for (int i = 0; i < utf16_len && out_pos < utf8_size - 1; i++) {
-        uint16_t c = utf16[i];
-        if (c < 0x80) utf8[out_pos++] = (char)c;
-        else if (c < 0x800) {
-            if (out_pos + 2 > utf8_size - 1) break;
-            utf8[out_pos++] = (char)(0xC0 | (c >> 6));
-            utf8[out_pos++] = (char)(0x80 | (c & 0x3F));
+    size_t out = 0;
+    for (int i = 0; i < utf16_len && out < utf8_size - 1; i++) {
+        uint32_t cp = utf16[i];
+        if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < utf16_len && utf16[i+1] >= 0xDC00 && utf16[i+1] <= 0xDFFF)
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (utf16[++i] - 0xDC00);
+        if (cp < 0x80) utf8[out++] = (char)cp;
+        else if (cp < 0x800) {
+            if (out + 2 > utf8_size - 1) break;
+            utf8[out++] = (char)(0xC0 | (cp >> 6));
+            utf8[out++] = (char)(0x80 | (cp & 0x3F));
+        } else if (cp < 0x10000) {
+            if (out + 3 > utf8_size - 1) break;
+            utf8[out++] = (char)(0xE0 | (cp >> 12));
+            utf8[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            utf8[out++] = (char)(0x80 | (cp & 0x3F));
         } else {
-            if (out_pos + 3 > utf8_size - 1) break;
-            utf8[out_pos++] = (char)(0xE0 | (c >> 12));
-            utf8[out_pos++] = (char)(0x80 | ((c >> 6) & 0x3F));
-            utf8[out_pos++] = (char)(0x80 | (c & 0x3F));
+            if (out + 4 > utf8_size - 1) break;
+            utf8[out++] = (char)(0xF0 | (cp >> 18));
+            utf8[out++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+            utf8[out++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+            utf8[out++] = (char)(0x80 | (cp & 0x3F));
         }
     }
-    utf8[out_pos] = '\0';
-    return out_pos;
+    utf8[out] = '\0';
+    return out;
 }
 
 #define utf16_to_utf8 utf16_to_utf8_common
@@ -249,6 +257,13 @@ static inline bool create_directories(const char* path) {
 
     if (success) g_dir_cache[idx] = h;
     return success;
+}
+
+static inline const char* get_basename(const char* path) {
+    const char* b = strrchr(path, '/');
+    const char* c = strrchr(path, '\\');
+    if (c && (!b || c > b)) b = c;
+    return b ? b + 1 : path;
 }
 
 #endif

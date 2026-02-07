@@ -13,22 +13,14 @@ typedef enum {
     ERR_INVALID_BOOTID,
     ERR_UNKNOWN_CONTAINER,
     ERR_KEY_NOT_FOUND,
-    ERR_INVALID_KEY_FILE,
     ERR_AES_ALIGNMENT,
-    ERR_IV_CALCULATION,
-    ERR_INVALID_NTFS,
-    ERR_INVALID_EXFAT,
-    ERR_INVALID_VHD,
-    ERR_MFT_CORRUPT,
-    ERR_PATH_UNSAFE,
-    ERR_DIR_CREATE,
     ERR_EXTRACTION_FAILED
 } ErrorCode;
 
 static inline const char* error_string(ErrorCode code) {
     static const char* const errs[] = {
         "ok", "mem", "open", "read", "write", "seek", "bootid", "container",
-        "key", "keyfile", "align", "iv", "ntfs", "exfat", "vhd", "mft", "path", "mkdir", "extract"
+        "key", "align", "extract"
     };
     return (code < sizeof(errs)/sizeof(errs[0])) ? errs[code] : "?";
 }

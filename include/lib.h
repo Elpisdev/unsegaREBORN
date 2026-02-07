@@ -32,8 +32,6 @@ typedef long intptr_t;
 
 typedef int64_t off_t;
 typedef int64_t time_t;
-typedef int64_t __time64_t;
-
 #ifndef __bool_true_false_are_defined
   #if __STDC_VERSION__ < 202311L
     typedef _Bool bool;
@@ -54,24 +52,10 @@ typedef __builtin_va_list va_list;
 extern "C" {
 #endif
 
-#define EPERM   1
 #define ENOENT  2
-#define ESRCH   3
-#define EINTR   4
-#define EIO     5
-#define ENXIO   6
-#define EBADF   9
-#define ENOMEM  12
 #define EACCES  13
-#define EFAULT  14
 #define EEXIST  17
-#define ENOTDIR 20
-#define EISDIR  21
 #define EINVAL  22
-#define EMFILE  24
-#define ENOSPC  28
-#define EROFS   30
-#define ERANGE  34
 
 #ifdef PLATFORM_WINDOWS
 
@@ -93,9 +77,11 @@ typedef int64_t LONGLONG;
 
 #define FILE_READ_DATA            0x0001
 #define FILE_WRITE_DATA           0x0002
+#define FILE_ADD_FILE             0x0002
 #define FILE_APPEND_DATA          0x0004
 #define FILE_READ_ATTRIBUTES      0x0080
 #define FILE_WRITE_ATTRIBUTES     0x0100
+#define FILE_TRAVERSE             0x0020
 #define FILE_LIST_DIRECTORY       0x0001
 #define DELETE                    0x00010000L
 #define SYNCHRONIZE               0x00100000L
@@ -182,10 +168,11 @@ typedef struct _FILE_BOTH_DIR_INFORMATION {
 } FILE_BOTH_DIR_INFORMATION;
 
 typedef enum _FILE_INFORMATION_CLASS {
+    FileBothDirectoryInformation = 3,
     FileBasicInformation = 4,
     FileStandardInformation = 5,
+    FileRenameInformation = 10,
     FilePositionInformation = 14,
-    FileBothDirectoryInformation = 3,
 } FILE_INFORMATION_CLASS;
 
 typedef struct _RTL_USER_PROCESS_PARAMETERS {
@@ -238,7 +225,6 @@ __declspec(dllimport) NTSTATUS __stdcall NtQueryDirectoryFile(HANDLE, HANDLE, vo
 __declspec(dllimport) NTSTATUS __stdcall NtQuerySystemTime(LARGE_INTEGER*);
 __declspec(dllimport) NTSTATUS __stdcall NtQueryInformationProcess(HANDLE, ULONG, void*, ULONG, ULONG*);
 __declspec(dllimport) NTSTATUS __stdcall NtQuerySystemInformation(ULONG, void*, ULONG, ULONG*);
-__declspec(dllimport) NTSTATUS __stdcall NtDelayExecution(uint8_t, LARGE_INTEGER*);
 __declspec(dllimport) void* __stdcall RtlAllocateHeap(HANDLE, ULONG, size_t);
 __declspec(dllimport) void* __stdcall RtlReAllocateHeap(HANDLE, ULONG, void*, size_t);
 __declspec(dllimport) uint8_t __stdcall RtlFreeHeap(HANDLE, ULONG, void*);
@@ -258,62 +244,37 @@ static inline PEB* lib_get_peb(void) {
 #define SYS_write           1
 #define SYS_open            2
 #define SYS_close           3
-#define SYS_fstat           5
 #define SYS_lseek           8
 #define SYS_mmap            9
-#define SYS_mprotect        10
 #define SYS_munmap          11
-#define SYS_brk             12
-#define SYS_ioctl           16
-#define SYS_access          21
-#define SYS_dup2            33
-#define SYS_getpid          39
-#define SYS_exit            60
-#define SYS_uname           63
-#define SYS_fcntl           72
-#define SYS_fsync           74
-#define SYS_ftruncate       77
 #define SYS_getdents64      217
-#define SYS_fadvise64       221
 #define SYS_exit_group      231
-#define SYS_openat          257
 #define SYS_mkdirat         258
 #define SYS_newfstatat      262
 #define SYS_unlinkat        263
+#define SYS_renameat        264
 #define SYS_utimensat       280
 
 #define O_RDONLY    0x0000
 #define O_WRONLY    0x0001
 #define O_RDWR      0x0002
 #define O_CREAT     0x0040
-#define O_EXCL      0x0080
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_DIRECTORY 0x10000
-#define O_CLOEXEC   0x80000
 
 #define S_IRWXU 0700
 #define S_IRUSR 0400
 #define S_IWUSR 0200
-#define S_IXUSR 0100
-#define S_IRWXG 0070
 #define S_IRGRP 0040
 #define S_IXGRP 0010
-#define S_IRWXO 0007
 #define S_IROTH 0004
 #define S_IXOTH 0001
-
-#define S_IFMT   0170000
-#define S_IFDIR  0040000
-#define S_IFREG  0100000
-#define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
-#define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 
 #define PROT_READ   0x1
 #define PROT_WRITE  0x2
 #define MAP_PRIVATE 0x02
 #define MAP_ANONYMOUS 0x20
-#define MAP_FAILED  ((void*)-1)
 
 #define SEEK_SET 0
 #define SEEK_CUR 1
@@ -322,7 +283,6 @@ static inline PEB* lib_get_peb(void) {
 #define AT_FDCWD (-100)
 
 #define DT_DIR  4
-#define DT_REG  8
 
 struct linux_dirent64 {
     uint64_t d_ino;
@@ -358,12 +318,6 @@ struct linux_timespec {
     int64_t tv_nsec;
 };
 
-static inline long syscall0(long n) {
-    long ret;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n) : "rcx", "r11", "memory");
-    return ret;
-}
-
 static inline long syscall1(long n, long a1) {
     long ret;
     __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1) : "rcx", "r11", "memory");
@@ -389,14 +343,6 @@ static inline long syscall4(long n, long a1, long a2, long a3, long a4) {
     return ret;
 }
 
-static inline long syscall5(long n, long a1, long a2, long a3, long a4, long a5) {
-    long ret;
-    register long r10 __asm__("r10") = a4;
-    register long r8 __asm__("r8") = a5;
-    __asm__ volatile ("syscall" : "=a"(ret) : "a"(n), "D"(a1), "S"(a2), "d"(a3), "r"(r10), "r"(r8) : "rcx", "r11", "memory");
-    return ret;
-}
-
 static inline long syscall6(long n, long a1, long a2, long a3, long a4, long a5, long a6) {
     long ret;
     register long r10 __asm__("r10") = a4;
@@ -407,10 +353,6 @@ static inline long syscall6(long n, long a1, long a2, long a3, long a4, long a5,
 }
 
 #endif
-
-#define _IOFBF 0
-#define _IOLBF 1
-#define _IONBF 2
 
 #define _A_SUBDIR 0x10
 
@@ -501,24 +443,19 @@ extern FILE* lib_stdin_file;
 FILE* lib_fopen(const char* path, const char* mode);
 size_t lib_fread(void* buf, size_t size, size_t count, FILE* f);
 size_t lib_fwrite(const void* buf, size_t size, size_t count, FILE* f);
-int lib_fseek(FILE* f, long offset, int whence);
 int lib_fseeki64(FILE* f, int64_t offset, int whence);
-long lib_ftell(FILE* f);
 int64_t lib_ftelli64(FILE* f);
 int lib_fclose(FILE* f);
 int lib_fflush(FILE* f);
 int lib_feof(FILE* f);
 char* lib_fgets(char* buf, int n, FILE* f);
 void lib_rewind(FILE* f);
-void lib_setvbuf(FILE* f, char* buf, int mode, size_t size);
 
 #define fopen lib_fopen
 #define fread lib_fread
 #define fwrite lib_fwrite
-#define fseek lib_fseek
 #define _fseeki64 lib_fseeki64
 #define fseeko lib_fseeki64
-#define ftell lib_ftell
 #define _ftelli64 lib_ftelli64
 #define ftello lib_ftelli64
 #define fclose lib_fclose
@@ -526,19 +463,19 @@ void lib_setvbuf(FILE* f, char* buf, int mode, size_t size);
 #define feof lib_feof
 #define fgets lib_fgets
 #define rewind lib_rewind
-#define setvbuf lib_setvbuf
 
 #ifdef PLATFORM_WINDOWS
+size_t utf8_to_utf16(const char* utf8, WCHAR* utf16, size_t utf16_max);
 FILE* lib_wfopen(const WCHAR* path, const WCHAR* mode);
 FILE* lib_wfopen_prealloc(const WCHAR* path, uint64_t size);
+HANDLE lib_open_dir_handle(const WCHAR* path);
+FILE* lib_fopen_relative(HANDLE dir_handle, const WCHAR* filename, uint64_t prealloc_size);
 bool lib_set_file_times_ntfs(FILE* f, int64_t modified_time, int64_t access_time);
-int lib_wutime(const WCHAR* path, const void* times);
-int lib_wutime_dir(const WCHAR* path, const void* times);
+int lib_wutime(const WCHAR* path, int64_t modified_time, int64_t access_time);
+int lib_wutime_dir(const WCHAR* path, int64_t modified_time, int64_t access_time);
 #define _wfopen lib_wfopen
-#define _wutime lib_wutime
-#endif
-
 size_t lib_fwrite_direct(FILE* f, const void* buf, size_t size);
+#endif
 
 int lib_printf(const char* fmt, ...);
 int lib_fprintf(FILE* f, const char* fmt, ...);
@@ -559,12 +496,13 @@ int lib_puts(const char* s);
 int lib_mkdir(const char* path);
 int lib_rmdir(const char* path);
 int lib_remove(const char* path);
+int lib_rename(const char* old_path, const char* new_path);
 
 #define mkdir lib_mkdir
-#define _mkdir lib_mkdir
 #define rmdir lib_rmdir
 #define _rmdir lib_rmdir
 #define remove lib_remove
+#define rename lib_rename
 
 #ifdef PLATFORM_WINDOWS
 int lib_wmkdir(const WCHAR* path);
@@ -587,22 +525,14 @@ int lib_findnext(intptr_t handle, lib_finddata_t* data);
 int lib_findclose(intptr_t handle);
 
 #define _finddata_t lib_finddata_t
-#define _finddata64_t lib_finddata_t
 #define _findfirst lib_findfirst
-#define _findfirst64 lib_findfirst
 #define _findnext lib_findnext
-#define _findnext64 lib_findnext
 #define _findclose lib_findclose
-
-int lib_isatty(int fd);
-#define isatty lib_isatty
-#define _isatty lib_isatty
 
 time_t lib_time(time_t* t);
 double lib_difftime(time_t t1, time_t t0);
 
 #define time lib_time
-#define _time64 lib_time
 #define difftime lib_difftime
 
 int lib_atoi(const char* s);
@@ -618,7 +548,6 @@ int* lib_errno_func(void);
 void lib_exit(int status);
 
 #define exit lib_exit
-#define _exit lib_exit
 
 #ifdef PLATFORM_WINDOWS
 #define PATH_SEPARATOR "\\"

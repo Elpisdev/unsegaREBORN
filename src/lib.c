@@ -102,9 +102,11 @@ void* lib_malloc(size_t size) {
 }
 
 void* lib_calloc(size_t count, size_t size) {
+    if (size && count > (size_t)-1 / size) return NULL;
     size_t total = count * size;
     if (!total) return NULL;
-    return RtlAllocateHeap(lib_heap, 0x08, total);
+#define HEAP_ZERO_MEMORY 0x08
+    return RtlAllocateHeap(lib_heap, HEAP_ZERO_MEMORY, total);
 }
 
 void* lib_realloc(void* ptr, size_t size) {
@@ -172,6 +174,7 @@ void* lib_malloc(size_t size) {
 }
 
 void* lib_calloc(size_t count, size_t size) {
+    if (size && count > (size_t)-1 / size) return NULL;
     size_t total = count * size;
     void* ptr = lib_malloc(total);
     if (ptr) lib_memset(ptr, 0, total);
@@ -312,23 +315,31 @@ void* memset(void* dst, int c, size_t n) __attribute__((alias("lib_memset")));
 #define memset lib_memset
 
 int lib_memcmp(const void* s1, const void* s2, size_t n) {
-    const uint8_t* p1 = s1; const uint8_t* p2 = s2;
+    const uint8_t *p1 = s1, *p2 = s2;
+    while (n >= 8) {
+        uint64_t a, b;
+        __builtin_memcpy(&a, p1, 8);
+        __builtin_memcpy(&b, p2, 8);
+        if (a != b) goto byte_cmp;
+        p1 += 8; p2 += 8; n -= 8;
+    }
+byte_cmp:
     while (n--) { if (*p1 != *p2) return *p1 - *p2; p1++; p2++; }
     return 0;
 }
 
 #ifdef PLATFORM_WINDOWS
 
-static size_t utf8_to_utf16(const char* utf8, WCHAR* utf16, size_t utf16_max) {
+size_t utf8_to_utf16(const char* utf8, WCHAR* utf16, size_t utf16_max) {
     size_t out = 0;
     const uint8_t* s = (const uint8_t*)utf8;
     while (*s && out < utf16_max - 1) {
         uint32_t cp;
         if (s[0] < 0x80) { cp = s[0]; s += 1; }
-        else if ((s[0] & 0xE0) == 0xC0) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); s += 2; }
-        else if ((s[0] & 0xF0) == 0xE0) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); s += 3; }
-        else if ((s[0] & 0xF8) == 0xF0) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); s += 4; }
-        else { cp = '?'; s += 1; }
+        else if ((s[0] & 0xE0) == 0xC0 && s[1]) { cp = ((s[0] & 0x1F) << 6) | (s[1] & 0x3F); s += 2; }
+        else if ((s[0] & 0xF0) == 0xE0 && s[1] && s[2]) { cp = ((s[0] & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); s += 3; }
+        else if ((s[0] & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) { cp = ((s[0] & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); s += 4; }
+        else { s += 1; continue; }
         if (cp <= 0xFFFF) utf16[out++] = (WCHAR)cp;
         else if (cp <= 0x10FFFF && out < utf16_max - 2) {
             cp -= 0x10000;
@@ -458,6 +469,44 @@ FILE* lib_wfopen_prealloc(const WCHAR* path, uint64_t size) {
     return f;
 }
 
+HANDLE lib_open_dir_handle(const WCHAR* path) {
+    UNICODE_STRING nt_path = {0};
+    if (!path_to_nt(path, &nt_path)) return INVALID_HANDLE_VALUE;
+    OBJECT_ATTRIBUTES oa = { sizeof(OBJECT_ATTRIBUTES), NULL, &nt_path, OBJ_CASE_INSENSITIVE, NULL, NULL };
+    HANDLE h; IO_STATUS_BLOCK iosb;
+    NTSTATUS status = NtCreateFile(&h, FILE_ADD_FILE | FILE_TRAVERSE | SYNCHRONIZE, &oa, &iosb, NULL,
+        FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+        FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0);
+    RtlFreeUnicodeString(&nt_path);
+    if (!NT_SUCCESS(status)) return INVALID_HANDLE_VALUE;
+    return h;
+}
+
+FILE* lib_fopen_relative(HANDLE dir_handle, const WCHAR* filename, uint64_t prealloc_size) {
+    UNICODE_STRING name_str;
+    name_str.Buffer = (WCHAR*)filename;
+    name_str.Length = 0;
+    while (filename[name_str.Length / 2]) name_str.Length += 2;
+    name_str.MaximumLength = name_str.Length + 2;
+
+    OBJECT_ATTRIBUTES oa = { sizeof(OBJECT_ATTRIBUTES), dir_handle, &name_str, OBJ_CASE_INSENSITIVE, NULL, NULL };
+    HANDLE h; IO_STATUS_BLOCK iosb;
+    LARGE_INTEGER alloc = {0};
+    if (prealloc_size) alloc.QuadPart = (LONGLONG)prealloc_size;
+
+    NTSTATUS status = NtCreateFile(&h, FILE_WRITE_DATA | FILE_WRITE_ATTRIBUTES | SYNCHRONIZE, &oa, &iosb,
+        prealloc_size ? &alloc : NULL, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_OVERWRITE_IF,
+        FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT | FILE_SEQUENTIAL_ONLY, NULL, 0);
+    if (!NT_SUCCESS(status)) return NULL;
+
+    FILE* f = pool_alloc_file();
+    if (!f) { NtClose(h); return NULL; }
+
+    f->handle = h; f->buf_pos = 0; f->buf_fill = 0; f->file_pos = 0; f->flags = LIB_FILE_WRITE;
+    if (fd_next < MAX_FD_TABLE) fd_table[fd_next++] = h;
+    return f;
+}
+
 size_t lib_fwrite_direct(FILE* f, const void* buf, size_t size) {
     if (!f || !buf || !size || !(f->flags & LIB_FILE_WRITE)) return 0;
     IO_STATUS_BLOCK iosb = {0};
@@ -493,6 +542,7 @@ static bool refill_read_buffer(FILE* f) {
 
 size_t lib_fread(void* buf, size_t size, size_t count, FILE* f) {
     if (!f || !buf || !size || !count || !(f->flags & LIB_FILE_READ)) return 0;
+    if (size > 1 && count > (size_t)-1 / size) return 0;
     size_t total = size * count, read_total = 0;
     uint8_t* dst = buf;
     while (total > 0) {
@@ -504,7 +554,7 @@ size_t lib_fread(void* buf, size_t size, size_t count, FILE* f) {
         } else {
             if (total >= f->buf_cap) {
                 IO_STATUS_BLOCK iosb = {0}; LARGE_INTEGER offset; offset.QuadPart = f->file_pos;
-                size_t chunk = (total / f->buf_cap) * f->buf_cap;
+                size_t chunk = total & ~((size_t)f->buf_cap - 1);
                 NTSTATUS status = NtReadFile(f->handle, NULL, NULL, NULL, &iosb, dst, (ULONG)chunk, &offset, NULL);
                 if (status == STATUS_END_OF_FILE || iosb.Information == 0) { f->flags |= LIB_FILE_EOF; break; }
                 if (!NT_SUCCESS(status)) { f->flags |= LIB_FILE_ERROR; break; }
@@ -518,12 +568,13 @@ size_t lib_fread(void* buf, size_t size, size_t count, FILE* f) {
 
 size_t lib_fwrite(const void* buf, size_t size, size_t count, FILE* f) {
     if (!f || !buf || !size || !count || !(f->flags & LIB_FILE_WRITE)) return 0;
+    if (size > 1 && count > (size_t)-1 / size) return 0;
     size_t total = size * count, written = 0;
     const uint8_t* src = buf;
     while (total >= f->buf_cap) {
         if (f->buf_fill > 0 && !flush_write_buffer(f)) return written / size;
         IO_STATUS_BLOCK iosb = {0}; LARGE_INTEGER offset; offset.QuadPart = f->file_pos;
-        size_t chunk = (total / f->buf_cap) * f->buf_cap;
+        size_t chunk = total & ~((size_t)f->buf_cap - 1);
         NTSTATUS status = NtWriteFile(f->handle, NULL, NULL, NULL, &iosb, (void*)src, (ULONG)chunk, &offset, NULL);
         if (!NT_SUCCESS(status)) { f->flags |= LIB_FILE_ERROR; return written / size; }
         f->file_pos += iosb.Information; src += iosb.Information; total -= iosb.Information; written += iosb.Information;
@@ -576,13 +627,6 @@ int lib_fclose(FILE* f) {
     NtClose(f->handle);
     if (f != &lib_stdout_impl && f != &lib_stderr_impl && f != &lib_stdin_impl) pool_free_file(f);
     return ret;
-}
-
-int lib_isatty(int fd) {
-    HANDLE h = (fd == 0) ? lib_stdin_handle : (fd == 1) ? lib_stdout_handle : (fd == 2) ? lib_stderr_handle : NULL;
-    if (!h || h == INVALID_HANDLE_VALUE) return 0;
-    FILE_STANDARD_INFORMATION info; IO_STATUS_BLOCK iosb;
-    return !NT_SUCCESS(NtQueryInformationFile(h, &iosb, &info, sizeof(info), FileStandardInformation));
 }
 
 #define EPOCH_DIFF 116444736000000000ULL
@@ -649,6 +693,7 @@ static bool refill_read_buffer(FILE* f) {
 
 size_t lib_fread(void* buf, size_t size, size_t count, FILE* f) {
     if (!f || !buf || !size || !count || !(f->flags & LIB_FILE_READ)) return 0;
+    if (size > 1 && count > (size_t)-1 / size) return 0;
     size_t total = size * count, read_total = 0;
     uint8_t* dst = buf;
     while (total > 0) {
@@ -670,8 +715,17 @@ size_t lib_fread(void* buf, size_t size, size_t count, FILE* f) {
 
 size_t lib_fwrite(const void* buf, size_t size, size_t count, FILE* f) {
     if (!f || !buf || !size || !count || !(f->flags & LIB_FILE_WRITE)) return 0;
+    if (size > 1 && count > (size_t)-1 / size) return 0;
     size_t total = size * count, written = 0;
     const uint8_t* src = buf;
+    while (total >= f->buf_cap) {
+        if (f->buf_fill > 0 && !flush_write_buffer(f)) return written / size;
+        size_t chunk = total & ~((size_t)f->buf_cap - 1);
+        long ret = syscall3(SYS_write, f->fd, (long)src, chunk);
+        if (ret < 0) { f->flags |= LIB_FILE_ERROR; return written / size; }
+        f->file_pos += ret; src += ret; total -= ret; written += ret;
+        if ((size_t)ret < chunk) return written / size;
+    }
     while (total > 0) {
         size_t space = f->buf_cap - f->buf_fill;
         if (space > 0) {
@@ -709,11 +763,6 @@ int lib_fclose(FILE* f) {
     return ret;
 }
 
-int lib_isatty(int fd) {
-    char buf[64];
-    return syscall3(SYS_ioctl, fd, 0x5413, (long)buf) >= 0;
-}
-
 time_t lib_time(time_t* t) {
     struct linux_timespec ts;
     syscall2(228, 0, (long)&ts);
@@ -723,8 +772,6 @@ time_t lib_time(time_t* t) {
 
 #endif
 
-int lib_fseek(FILE* f, long offset, int whence) { return lib_fseeki64(f, (int64_t)offset, whence); }
-long lib_ftell(FILE* f) { return (long)lib_ftelli64(f); }
 int lib_feof(FILE* f) { return f ? (f->flags & LIB_FILE_EOF) != 0 : 0; }
 static int lib_fgetc(FILE* f) { unsigned char c; return (lib_fread(&c, 1, 1, f) == 1) ? c : EOF; }
 static int lib_fputc(int c, FILE* f) { unsigned char ch = (unsigned char)c; return (lib_fwrite(&ch, 1, 1, f) == 1) ? ch : EOF; }
@@ -744,7 +791,6 @@ char* lib_fgets(char* buf, int n, FILE* f) {
 }
 
 void lib_rewind(FILE* f) { if (f) { lib_fseeki64(f, 0, SEEK_SET); } }
-void lib_setvbuf(FILE* f, char* buf, int mode, size_t size) { (void)f; (void)buf; (void)mode; (void)size; }
 double lib_difftime(time_t t1, time_t t0) { return (double)(t1 - t0); }
 
 static char* fmt_uint64(char* buf, uint64_t val, int base, int width, char pad, bool upper) {
@@ -876,6 +922,41 @@ int lib_rmdir(const char* path) {
     return -1;
 }
 
+int lib_rename(const char* old_path, const char* new_path) {
+    WCHAR wold[1024]; utf8_to_utf16(old_path, wold, 1024);
+    WCHAR wnew[1024]; utf8_to_utf16(new_path, wnew, 1024);
+
+    HANDLE h = nt_open_file(wold, DELETE | SYNCHRONIZE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        FILE_OPEN, FILE_DIRECTORY_FILE);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+
+    UNICODE_STRING nt_new = {0};
+    if (!path_to_nt(wnew, &nt_new)) { NtClose(h); return -1; }
+
+    struct {
+        uint8_t ReplaceIfExists;
+        HANDLE RootDirectory;
+        ULONG FileNameLength;
+        WCHAR FileName[1024];
+    } rename_info;
+    rename_info.ReplaceIfExists = 0;
+    rename_info.RootDirectory = NULL;
+    rename_info.FileNameLength = nt_new.Length;
+    memcpy(rename_info.FileName, nt_new.Buffer, nt_new.Length);
+
+    IO_STATUS_BLOCK iosb;
+    NTSTATUS status = NtSetInformationFile(h, &iosb, &rename_info,
+        (ULONG)(sizeof(rename_info) - sizeof(rename_info.FileName) + nt_new.Length),
+        FileRenameInformation);
+
+    RtlFreeUnicodeString(&nt_new);
+    NtClose(h);
+    if (NT_SUCCESS(status)) return 0;
+    lib_errno_val = (int)status;
+    return -1;
+}
+
 typedef struct { HANDLE dir_handle; WCHAR pattern[260]; uint8_t buffer[4096]; uint32_t buf_pos; uint32_t buf_len; bool first_call; } FindState;
 
 static HANDLE open_directory_for_enum(const char* pattern, WCHAR* out_pattern) {
@@ -948,37 +1029,21 @@ bool lib_set_file_times_ntfs(FILE* f, int64_t modified_time, int64_t access_time
     return NT_SUCCESS(NtSetInformationFile(f->handle, &iosb, &info, sizeof(info), FileBasicInformation));
 }
 
-int lib_wutime(const WCHAR* path, const void* times_ptr) {
-    HANDLE h = nt_open_file(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_NON_DIRECTORY_FILE);
+static int lib_wutime_impl(const WCHAR* path, int64_t modified_time, int64_t access_time, bool is_dir) {
+    HANDLE h = nt_open_file(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN,
+        is_dir ? FILE_DIRECTORY_FILE : FILE_NON_DIRECTORY_FILE);
     if (h == INVALID_HANDLE_VALUE) return -1;
-    typedef struct { int64_t actime; int64_t modtime; } utimbuf64;
-    const utimbuf64* times = times_ptr;
     FILE_BASIC_INFORMATION info = {0}; IO_STATUS_BLOCK iosb;
     NtQueryInformationFile(h, &iosb, &info, sizeof(info), FileBasicInformation);
-    if (times) {
-        info.LastAccessTime.QuadPart = (times->actime + 11644473600LL) * 10000000LL;
-        info.LastWriteTime.QuadPart = (times->modtime + 11644473600LL) * 10000000LL;
-    }
+    info.LastAccessTime.QuadPart = access_time;
+    info.LastWriteTime.QuadPart = modified_time;
     NTSTATUS status = NtSetInformationFile(h, &iosb, &info, sizeof(info), FileBasicInformation);
     NtClose(h);
     return NT_SUCCESS(status) ? 0 : -1;
 }
 
-int lib_wutime_dir(const WCHAR* path, const void* times_ptr) {
-    HANDLE h = nt_open_file(path, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE, FILE_OPEN, FILE_DIRECTORY_FILE);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    typedef struct { int64_t actime; int64_t modtime; } utimbuf64;
-    const utimbuf64* times = times_ptr;
-    FILE_BASIC_INFORMATION info = {0}; IO_STATUS_BLOCK iosb;
-    NtQueryInformationFile(h, &iosb, &info, sizeof(info), FileBasicInformation);
-    if (times) {
-        info.LastAccessTime.QuadPart = (times->actime + 11644473600LL) * 10000000LL;
-        info.LastWriteTime.QuadPart = (times->modtime + 11644473600LL) * 10000000LL;
-    }
-    NTSTATUS status = NtSetInformationFile(h, &iosb, &info, sizeof(info), FileBasicInformation);
-    NtClose(h);
-    return NT_SUCCESS(status) ? 0 : -1;
-}
+int lib_wutime(const WCHAR* path, int64_t modified_time, int64_t access_time) { return lib_wutime_impl(path, modified_time, access_time, false); }
+int lib_wutime_dir(const WCHAR* path, int64_t modified_time, int64_t access_time) { return lib_wutime_impl(path, modified_time, access_time, true); }
 
 #else
 
@@ -996,6 +1061,12 @@ int lib_remove(const char* path) {
 
 int lib_rmdir(const char* path) {
     long ret = syscall3(SYS_unlinkat, AT_FDCWD, (long)path, 0x200);
+    if (ret < 0) { lib_errno_val = (int)(-ret); return -1; }
+    return 0;
+}
+
+int lib_rename(const char* old_path, const char* new_path) {
+    long ret = syscall4(SYS_renameat, AT_FDCWD, (long)old_path, AT_FDCWD, (long)new_path);
     if (ret < 0) { lib_errno_val = (int)(-ret); return -1; }
     return 0;
 }

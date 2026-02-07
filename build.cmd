@@ -5,6 +5,17 @@ goto :WINDOWS
 #!/bin/sh
 set -e
 mkdir -p build
+DATESTR=$(date +%Y%m%d)
+REV=-1
+TAG_REV=$(git tag -l "${DATESTR}*" 2>/dev/null | sed "s/^${DATESTR}//" | sort -rn | head -1)
+[ -n "$TAG_REV" ] && REV=$((10#$TAG_REV))
+if [ -f build/.buildrev ]; then
+    read LAST_DATE LAST_REV < build/.buildrev
+    [ "$LAST_DATE" = "$DATESTR" ] && [ "$LAST_REV" -gt "$REV" ] && REV=$LAST_REV
+fi
+REV=$((REV + 1))
+DATECODE=$(printf "%s%02d" "$DATESTR" "$REV")
+echo "$DATESTR $REV" > build/.buildrev
 
 SRC="src/lib.c src/main.c src/crypto.c src/keys.c src/exfat.c src/ntfs.c src/stream.c src/aes.c"
 
@@ -28,7 +39,7 @@ case "$(uname -s)" in
 esac
 
 echo "building..."
-clang $CFLAGS $LDFLAGS -o $OUT $SRC $LIBS
+clang $CFLAGS $LDFLAGS -DVERSION="\"$DATECODE\"" -o $OUT $SRC $LIBS
 echo "done: $OUT ($(stat -c%s "$OUT" 2>/dev/null || stat -f%z "$OUT") bytes)"
 exit 0
 
@@ -64,8 +75,30 @@ for %%L in (
 set CFLAGS=-target x86_64-pc-windows-gnu -Oz -maes -msse4.1 -I include -fno-asynchronous-unwind-tables -fno-ident -ffunction-sections -fdata-sections -flto -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -fno-unwind-tables -fno-exceptions -fmerge-all-constants -fno-addrsig
 set LDFLAGS=-fuse-ld=lld -Wl,--gc-sections -Wl,--icf=all -Wl,-e,_start -Wl,--subsystem,console -Wl,-s -Wl,--lto-Oz %LIBPATH%
 
+for /f %%a in ('wmic os get localdatetime /value ^| find "="') do for /f "tokens=2 delims==" %%b in ("%%a") do set "DT=%%b"
+set "DATESTR=%DT:~0,8%"
+set REV=-1
+set "LASTTAG="
+for /f %%r in ('git tag -l "%DATESTR%*" 2^>nul ^| sort') do set "LASTTAG=%%r"
+if defined LASTTAG call :parsetag
+if exist build\.buildrev (
+    for /f "tokens=1,2" %%x in (build\.buildrev) do (
+        if "%%x"=="%DATESTR%" if %%y GTR %REV% set REV=%%y
+    )
+)
+set /a REV+=1
+set "REVSTR=0%REV%"
+set "DATECODE=%DATESTR%%REVSTR:~-2%"
+(echo %DATESTR% %REV%)>build\.buildrev
+goto :buildstart
+
+:parsetag
+set /a "REV=1%LASTTAG:~8% - 100"
+goto :eof
+
+:buildstart
 echo building...
-clang %CFLAGS% %LDFLAGS% -o build\unsegareborn-win-x64.exe %SRC% -lntdll
+clang %CFLAGS% %LDFLAGS% -DVERSION="\"%DATECODE%\"" -o build\unsegareborn-win-x64.exe %SRC% -lntdll
 
 if exist build\unsegareborn-win-x64.exe (
     for %%F in (build\unsegareborn-win-x64.exe) do echo done: %%~nxF ^(%%~zF bytes^)

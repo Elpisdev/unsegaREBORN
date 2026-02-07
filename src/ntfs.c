@@ -1,15 +1,13 @@
 #include "ntfs.h"
 #include "exfat.h"
-#include "progress.h"
 #define BUFFER_SIZE (1024 * 1024)
 
 uint32_t g_dir_cache[DIR_CACHE_SIZE];
 bool g_dir_cache_init;
 
 static bool vhd_read(VHDContext* ctx, void* buffer, uint64_t offset, size_t size);
-static bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t depth);
-static void vhd_close(VHDContext* ctx);
-static bool read_bytes_from_runs(NTFSContext* ctx, const DataRun* runs, int run_count,
+bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t depth);
+bool ntfs_read_from_runs(NTFSContext* ctx, const DataRun* runs, int run_count,
     uint64_t file_size, uint64_t read_offset, void* buffer, size_t read_size);
 
 static uint32_t swap32(uint32_t value) {
@@ -91,6 +89,8 @@ static bool apply_mft_fixups(const NTFSContext* ctx, uint8_t* record_buffer, siz
 static bool read_file_info(NTFSContext* ctx, uint64_t ref_number, FileInfo* info) {
     memset(info, 0, sizeof(FileInfo));
 
+    if (ref_number >= ctx->total_mft_records) return false;
+
     uint64_t mft_offset = ctx->mft_offset + (ref_number * ctx->mft_record_size);
 
     if (!ctx->lookup_buffer) {
@@ -162,7 +162,7 @@ static inline size_t hash_ref(uint64_t ref, size_t capacity) {
     ref ^= ref >> 33;
     ref *= 0xc4ceb9fe1a85ec53ULL;
     ref ^= ref >> 33;
-    return ref % capacity;
+    return ref & (capacity - 1);
 }
 
 static bool init_directory_cache(DirectoryCache* cache) {
@@ -171,7 +171,7 @@ static bool init_directory_cache(DirectoryCache* cache) {
     cache->entries = calloc(cache->capacity, sizeof(DirectoryEntry));
     if (!cache->entries) return false;
 
-    uint64_t hash = 5 % cache->capacity;
+    uint64_t hash = 5 & (cache->capacity - 1);
     cache->entries[hash].ref_number = 5;
     cache->entries[hash].path[0] = '\0';
     cache->entries[hash].occupied = true;
@@ -195,7 +195,7 @@ static bool resize_directory_cache(DirectoryCache* cache) {
         if (cache->entries[i].occupied) {
             size_t idx = hash_ref(cache->entries[i].ref_number, new_capacity);
             while (new_entries[idx].occupied) {
-                idx = (idx + 1) % new_capacity;
+                idx = (idx + 1) & (new_capacity - 1);
             }
             new_entries[idx] = cache->entries[i];
         }
@@ -219,7 +219,7 @@ static bool add_directory_to_cache(DirectoryCache* cache, uint64_t ref_number, c
             cache->entries[idx].path[MAX_PATH_LENGTH - 1] = '\0';
             return true;
         }
-        idx = (idx + 1) % cache->capacity;
+        idx = (idx + 1) & (cache->capacity - 1);
     }
 
     cache->entries[idx].ref_number = ref_number;
@@ -236,7 +236,7 @@ static const char* get_cached_path(DirectoryCache* cache, uint64_t ref_number) {
         if (cache->entries[idx].ref_number == ref_number) {
             return cache->entries[idx].path;
         }
-        idx = (idx + 1) % cache->capacity;
+        idx = (idx + 1) & (cache->capacity - 1);
     }
     return NULL;
 }
@@ -249,6 +249,10 @@ static bool build_path_impl(NTFSContext* ctx, uint64_t ref_number, char* buffer,
     if (ref_number == 5) {
         buffer[0] = '\0';
         return true;
+    }
+
+    for (int i = 0; i < ctx->skip_ref_count; i++) {
+        if (ctx->skip_refs[i] == ref_number) return false;
     }
 
     const char* cached_path = get_cached_path(&ctx->dir_cache, ref_number);
@@ -354,16 +358,13 @@ static bool extract_data_from_runs(NTFSContext* ctx, const DataRun* runs, int ru
             total_written += to_read;
 
             ctx->extracted_bytes += to_read;
-            if (ctx->progress) {
-                progress_update((Progress*)ctx->progress, ctx->extracted_bytes);
-            }
         }
     }
 
     return success;
 }
 
-static bool read_bytes_from_runs(NTFSContext* ctx, const DataRun* runs, int run_count,
+bool ntfs_read_from_runs(NTFSContext* ctx, const DataRun* runs, int run_count,
     uint64_t file_size, uint64_t read_offset, void* buffer, size_t read_size) {
     if (read_offset + read_size > file_size) {
         return false;
@@ -439,6 +440,20 @@ static int parse_data_runs(const uint8_t* run_list, size_t run_list_len, DataRun
     return count;
 }
 
+static int64_t find_ntfs_partition_offset(const uint8_t* mbr) {
+    if (mbr[510] != 0x55 || mbr[511] != 0xAA) return -1;
+    for (int i = 0; i < 4; i++) {
+        const uint8_t* part = mbr + 0x1BE + (i * 16);
+        if (part[4] == NTFS_PARTITION_TYPE) {
+            uint32_t lba_start;
+            memcpy(&lba_start, part + 8, sizeof(uint32_t));
+            if (lba_start == 0) continue;
+            return (int64_t)lba_start * VHD_SECTOR_SIZE;
+        }
+    }
+    return -1;
+}
+
 static int parse_internal_vhd_number(const char* filename) {
     if (strncmp(filename, "internal_", 9) != 0) return -1;
 
@@ -456,54 +471,54 @@ static int parse_internal_vhd_number(const char* filename) {
     return atoi(num_str);
 }
 
-static bool store_pending_vhd(NTFSContext* ctx, const MFTRecordHeader* record, int vhd_number) {
-    if (ctx->pending_vhd_count >= MAX_PENDING_VHDS) return false;
-
+static bool extract_nonresident_data_runs(const MFTRecordHeader* record, uint32_t mft_record_size,
+                                          DataRun* out_runs, int* out_run_count, uint64_t* out_file_size) {
+    uint32_t safe_used = record->bytes_used;
+    if (safe_used > mft_record_size) safe_used = mft_record_size;
+    if (record->attrs_offset >= mft_record_size) return false;
     const uint8_t* attr = (const uint8_t*)record + record->attrs_offset;
-    while (attr < (const uint8_t*)record + record->bytes_used) {
+    while (attr < (const uint8_t*)record + safe_used) {
         const AttributeHeader* header = (const AttributeHeader*)attr;
-
         if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
         if (header->type == DATA_ATTR && header->name_length == 0 && header->non_resident) {
-            PendingVHD* pending = &ctx->pending_vhds[ctx->pending_vhd_count];
-            const uint8_t* run_list = attr + header->data.non_resident.mapping_pairs_offset;
-            size_t run_list_len = header->length - header->data.non_resident.mapping_pairs_offset;
-            pending->run_count = parse_data_runs(run_list, run_list_len, pending->runs, MAX_DATA_RUNS);
-            pending->file_size = header->data.non_resident.data_size;
-            pending->vhd_number = vhd_number;
-            ctx->pending_vhd_count++;
-            return true;
+            if (header->data.non_resident.mapping_pairs_offset >= header->length) break;
+            *out_file_size = header->data.non_resident.data_size;
+            *out_run_count = parse_data_runs(
+                attr + header->data.non_resident.mapping_pairs_offset,
+                header->length - header->data.non_resident.mapping_pairs_offset,
+                out_runs, MAX_DATA_RUNS);
+            return *out_run_count > 0;
         }
         attr += header->length;
     }
     return false;
 }
 
+static bool store_pending_vhd(NTFSContext* ctx, const MFTRecordHeader* record, int vhd_number) {
+    if (ctx->pending_vhd_count >= MAX_PENDING_VHDS) return false;
+
+    PendingVHD* pending = &ctx->pending_vhds[ctx->pending_vhd_count];
+    if (!extract_nonresident_data_runs(record, ctx->mft_record_size,
+            pending->runs, &pending->run_count, &pending->file_size)) {
+        return false;
+    }
+    pending->vhd_number = vhd_number;
+    ctx->pending_vhd_count++;
+    return true;
+}
+
 static bool store_pending_opt(NTFSContext* ctx, const char* filename, const MFTRecordHeader* record) {
     if (ctx->pending_opt_count >= MAX_PENDING_OPTS) return false;
 
-    const uint8_t* attr = (const uint8_t*)record + record->attrs_offset;
-    while (attr < (const uint8_t*)record + record->bytes_used) {
-        const AttributeHeader* header = (const AttributeHeader*)attr;
-
-        if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
-        if (header->type == DATA_ATTR && header->name_length == 0 && header->non_resident) {
-            PendingOpt* pending = &ctx->pending_opts[ctx->pending_opt_count];
-            const uint8_t* run_list = attr + header->data.non_resident.mapping_pairs_offset;
-            size_t run_list_len = header->length - header->data.non_resident.mapping_pairs_offset;
-            pending->run_count = parse_data_runs(run_list, run_list_len, pending->runs, MAX_DATA_RUNS);
-            pending->file_size = header->data.non_resident.data_size;
-            pending->data_offset = ctx->data_start_offset;
-            strncpy(pending->filename, filename, MAX_FILENAME_LENGTH - 1);
-            pending->filename[MAX_FILENAME_LENGTH - 1] = '\0';
-            ctx->pending_opt_count++;
-            return true;
-        }
-        attr += header->length;
+    PendingOpt* pending = &ctx->pending_opts[ctx->pending_opt_count];
+    if (!extract_nonresident_data_runs(record, ctx->mft_record_size,
+            pending->runs, &pending->run_count, &pending->file_size)) {
+        return false;
     }
-    return false;
+    strncpy(pending->filename, filename, MAX_FILENAME_LENGTH - 1);
+    pending->filename[MAX_FILENAME_LENGTH - 1] = '\0';
+    ctx->pending_opt_count++;
+    return true;
 }
 
 static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
@@ -511,9 +526,12 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
 
     const char* ext = strrchr(filename, '.');
     bool is_opt_file = ext && strcmp(ext, ".opt") == 0;
+    int vhd_num = parse_internal_vhd_number(filename);
+
+    if (vhd_num >= 0 && vhd_num > ctx->highest_extracted_vhd)
+        ctx->highest_extracted_vhd = vhd_num;
 
     if (ctx->stream) {
-        int vhd_num = parse_internal_vhd_number(filename);
         if (vhd_num >= 0) {
             return store_pending_vhd(ctx, record, vhd_num);
         }
@@ -524,8 +542,9 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
 
     uint64_t file_size = 0;
     const uint8_t* data_attr = NULL;
+    uint32_t safe_bytes = min(record->bytes_used, ctx->mft_record_size);
     const uint8_t* attr = (const uint8_t*)record + record->attrs_offset;
-    while (attr < (const uint8_t*)record + record->bytes_used) {
+    while (attr < (const uint8_t*)record + safe_bytes) {
         const AttributeHeader* header = (const AttributeHeader*)attr;
         if (header->type == 0xFFFFFFFF || header->length == 0) break;
         if (header->type == DATA_ATTR && header->name_length == 0) {
@@ -545,21 +564,28 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
     strncpy(parent_path, full_path, sizeof(parent_path) - 1);
     parent_path[sizeof(parent_path) - 1] = '\0';
 
-    char* last_separator = strrchr(parent_path, PATH_SEPARATOR[0]);
+    char* last_separator = strrchr(parent_path, PATH_SEP_CHAR);
     if (last_separator) {
         *last_separator = '\0';
         if (strcmp(parent_path, ctx->last_dir) != 0) {
             create_directories(parent_path);
+            close_output_dir(ctx->cached_dir);
+            ctx->cached_dir = open_output_dir(parent_path);
             strncpy(ctx->last_dir, parent_path, MAX_PATH_LENGTH - 1);
             ctx->last_dir[MAX_PATH_LENGTH - 1] = '\0';
         }
     }
 
-    FILE* out_file;
-    if (file_size >= 65536) {
-        out_file = FOPEN_PREALLOC(full_path, file_size);
-    } else {
-        out_file = FOPEN(full_path, "wb");
+    FILE* out_file = NULL;
+    if (ctx->cached_dir != INVALID_DIR_HANDLE) {
+        out_file = fopen_in_dir(ctx->cached_dir, filename, file_size >= 65536 ? file_size : 0);
+    }
+    if (!out_file) {
+        if (file_size >= 65536) {
+            out_file = FOPEN_PREALLOC(full_path, file_size);
+        } else {
+            out_file = FOPEN(full_path, "wb");
+        }
     }
     if (!out_file) {
         return false;
@@ -569,6 +595,11 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
     const AttributeHeader* header = (const AttributeHeader*)data_attr;
 
     if (header->non_resident) {
+        if (header->data.non_resident.mapping_pairs_offset >= header->length) {
+            fclose(out_file);
+            REMOVE(full_path);
+            return false;
+        }
         DataRun runs[256];
         const uint8_t* run_list = data_attr + header->data.non_resident.mapping_pairs_offset;
         size_t run_list_len = header->length - header->data.non_resident.mapping_pairs_offset;
@@ -577,14 +608,16 @@ static bool extract_file(NTFSContext* ctx, const MFTRecordHeader* record,
         success = extract_data_from_runs(ctx, runs, run_count, file_size, out_file);
     }
     else {
+        if (header->data.resident.value_offset + header->data.resident.value_length > header->length) {
+            fclose(out_file);
+            REMOVE(full_path);
+            return false;
+        }
         const uint8_t* data = data_attr + header->data.resident.value_offset;
         uint32_t len = header->data.resident.value_length;
         success = (FWRITE_DIRECT(out_file, data, len) == len);
         if (success) {
             ctx->extracted_bytes += len;
-            if (ctx->progress) {
-                progress_update((Progress*)ctx->progress, ctx->extracted_bytes);
-            }
         }
     }
 
@@ -627,9 +660,10 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
     uint64_t parent_ref = 0;
     uint64_t modification_time = 0;
     uint64_t access_time = 0;
+    uint32_t file_flags = 0;
     bool got_filename = false;
     bool is_directory = (record->flags & MFT_RECORD_IS_DIRECTORY) != 0;
-    uint64_t record_num = record->record_number & 0xFFFFFFFFFFFF;
+    uint64_t record_num = *(const uint32_t*)(record_data + 0x2C);
 
     const uint8_t* record_end = record_data + bytes_used;
     const uint8_t* attr = record_data + attrs_offset;
@@ -642,6 +676,15 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
         }
         if (header->length < sizeof(AttributeHeader) || attr + header->length > record_end) {
             break;
+        }
+
+        if (header->type == 0x10 && !header->non_resident) {
+            uint16_t vo = header->data.resident.value_offset;
+            uint32_t vl = header->data.resident.value_length;
+            if (vo + vl <= header->length && vl >= 36) {
+                const uint8_t* si = attr + vo;
+                file_flags = *(const uint32_t*)(si + 32);
+            }
         }
 
         if (header->type == FILE_NAME_ATTR && !header->non_resident) {
@@ -673,14 +716,28 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
         return true;
     }
 
+    if (is_directory && parent_ref == 5 && (file_flags & 0x04)) {
+        if (ctx->skip_ref_count < 8)
+            ctx->skip_refs[ctx->skip_ref_count++] = record_num;
+        return true;
+    }
+
     if (!is_safe_path(filename)) {
         return true;
     }
 
-
+    char parent_path[MAX_PATH_LENGTH];
+    bool parent_ok = build_path_recursively(ctx, parent_ref, parent_path, sizeof(parent_path));
+    if (!parent_ok && parent_ref != 5) {
+        return true;
+    }
 
     char full_path[MAX_PATH_LENGTH];
-    get_full_path(ctx, parent_ref, filename, full_path, sizeof(full_path));
+    if (!parent_ok || parent_path[0] == '\0') {
+        snprintf(full_path, sizeof(full_path), "%s%s%s", ctx->base_path, PATH_SEPARATOR, filename);
+    } else {
+        snprintf(full_path, sizeof(full_path), "%s%s%s%s%s", ctx->base_path, PATH_SEPARATOR, parent_path, PATH_SEPARATOR, filename);
+    }
 
     if (is_directory) {
         if (!create_directories(full_path)) {
@@ -690,13 +747,8 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
         if (modification_time != 0) {
             DeferredDirTime* dirs = (DeferredDirTime*)ctx->deferred_dirs;
             if (ctx->deferred_count >= ctx->deferred_capacity) {
-                uint32_t new_cap = ctx->deferred_capacity ? ctx->deferred_capacity * 2 : 256;
-                DeferredDirTime* new_buf = realloc(dirs, new_cap * sizeof(DeferredDirTime));
-                if (new_buf) {
-                    ctx->deferred_dirs = new_buf;
-                    ctx->deferred_capacity = new_cap;
-                    dirs = new_buf;
-                }
+                if (grow_deferred_dirs(&dirs, &ctx->deferred_capacity))
+                    ctx->deferred_dirs = dirs;
             }
             if (ctx->deferred_count < ctx->deferred_capacity) {
                 DeferredDirTime* d = &dirs[ctx->deferred_count++];
@@ -721,7 +773,7 @@ static bool process_mft_record(NTFSContext* ctx, const uint8_t* record_data) {
 static bool vhd_raw_read(VHDContext* ctx, void* buffer, uint64_t offset, size_t size) {
     if (ctx->run_source) {
         NTFSContext* ntfs = (NTFSContext*)ctx->run_source->ntfs_ctx;
-        return read_bytes_from_runs(ntfs, ctx->run_source->runs, ctx->run_source->run_count,
+        return ntfs_read_from_runs(ntfs, ctx->run_source->runs, ctx->run_source->run_count,
             ctx->run_source->file_size, offset, buffer, size);
     }
     if (FSEEKO(ctx->fp, offset, SEEK_SET) != 0) {
@@ -788,7 +840,7 @@ static bool vhd_read_dynamic_block(VHDContext* ctx, uint8_t* buf, uint64_t offse
                 for (uint32_t s = start_sector; s < end_sector; s++) {
                     uint32_t byte_idx = s / 8;
                     uint32_t bit_idx = 7 - (s % 8);
-                    bool sector_present = (ctx->sector_bitmap[byte_idx] >> bit_idx) & 1;
+                    bool sector_present = (byte_idx < ctx->sector_bitmap_size) && ((ctx->sector_bitmap[byte_idx] >> bit_idx) & 1);
 
                     uint32_t sector_start_in_block = s * VHD_SECTOR_SIZE;
                     uint32_t sector_end_in_block = sector_start_in_block + VHD_SECTOR_SIZE;
@@ -853,12 +905,10 @@ static void extract_base_dir(const char* filepath, char* base_dir, size_t base_d
 }
 
 static const char* extract_filename(const char* path) {
-    const char* last_slash = strrchr(path, '/');
-    const char* last_backslash = strrchr(path, '\\');
-    const char* filename = path;
-    if (last_slash && last_slash > filename) filename = last_slash + 1;
-    if (last_backslash && last_backslash > filename - 1) filename = last_backslash + 1;
-    return filename;
+    const char* b = strrchr(path, '/');
+    const char* c = strrchr(path, '\\');
+    if (c && (!b || c > b)) b = c;
+    return b ? b + 1 : path;
 }
 
 static bool try_parent_path(const char* base_dir, const char* filename, char* parent_path, size_t path_size) {
@@ -912,7 +962,7 @@ static bool resolve_parent_path(VHDContext* ctx, char* parent_path, size_t path_
     return false;
 }
 
-static void vhd_close(VHDContext* ctx) {
+void vhd_close(VHDContext* ctx) {
     if (!ctx) return;
 
     if (ctx->parent) {
@@ -950,6 +1000,10 @@ static bool vhd_init_dynamic_header(VHDContext* ctx) {
     ctx->dyn_header.max_bat_entries = swap32(ctx->dyn_header.max_bat_entries);
     ctx->dyn_header.block_size = swap32(ctx->dyn_header.block_size);
     ctx->dyn_header.parent_timestamp = swap32(ctx->dyn_header.parent_timestamp);
+
+    if (ctx->dyn_header.block_size == 0 ||
+        (ctx->dyn_header.block_size & (ctx->dyn_header.block_size - 1)) != 0 ||
+        ctx->dyn_header.block_size > (256ULL << 20)) return false;
 
     size_t bat_size = (size_t)ctx->dyn_header.max_bat_entries * sizeof(uint32_t);
 
@@ -1010,21 +1064,25 @@ static bool vhd_read_footer(VHDContext* ctx) {
     return true;
 }
 
-static bool vhd_init_common(VHDContext* ctx, const char* base_dir, uint32_t depth) {
+static bool vhd_init_footer_and_header(VHDContext* ctx) {
     if (!vhd_read_footer(ctx)) {
         return false;
     }
-
-    if (ctx->footer.disk_type == VHD_TYPE_DYNAMIC) {
+    if (ctx->footer.disk_type == VHD_TYPE_DYNAMIC ||
+        ctx->footer.disk_type == VHD_TYPE_DIFFERENCING) {
         if (!vhd_init_dynamic_header(ctx)) {
             return false;
         }
     }
-    else if (ctx->footer.disk_type == VHD_TYPE_DIFFERENCING) {
-        if (!vhd_init_dynamic_header(ctx)) {
-            return false;
-        }
+    return true;
+}
 
+static bool vhd_init_common(VHDContext* ctx, const char* base_dir, uint32_t depth) {
+    if (!vhd_init_footer_and_header(ctx)) {
+        return false;
+    }
+
+    if (ctx->footer.disk_type == VHD_TYPE_DIFFERENCING) {
         char parent_path[MAX_PATH_LENGTH];
         if (resolve_parent_path(ctx, parent_path, sizeof(parent_path))) {
             ctx->parent = malloc(sizeof(VHDContext));
@@ -1042,7 +1100,7 @@ static bool vhd_init_common(VHDContext* ctx, const char* base_dir, uint32_t dept
     return true;
 }
 
-static bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t depth) {
+bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t depth) {
     memset(ctx, 0, sizeof(VHDContext));
     ctx->depth = depth;
 
@@ -1065,11 +1123,53 @@ static bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t de
     return true;
 }
 
-static bool vhd_init(VHDContext* ctx, const char* filename) {
-    return vhd_init_internal(ctx, filename, 0);
+static bool vhd_init_with_parent(VHDContext* ctx, const char* filename, VHDContext* external_parent) {
+    memset(ctx, 0, sizeof(VHDContext));
+    extract_base_dir(filename, ctx->base_dir, sizeof(ctx->base_dir));
+
+    ctx->fp = FOPEN(filename, "rb");
+    if (!ctx->fp) return false;
+
+    if (!vhd_init_footer_and_header(ctx)) {
+        vhd_close(ctx);
+        return false;
+    }
+
+    if (ctx->footer.disk_type == VHD_TYPE_DIFFERENCING) {
+        bool got_parent = false;
+        if (external_parent &&
+            memcmp(ctx->dyn_header.parent_id, external_parent->footer.unique_id, 16) == 0) {
+            ctx->parent = external_parent;
+            got_parent = true;
+        } else if (external_parent) {
+            fprintf(stderr, "parent mismatch\n");
+        }
+
+        if (!got_parent) {
+            char parent_path[MAX_PATH_LENGTH];
+            if (resolve_parent_path(ctx, parent_path, sizeof(parent_path))) {
+                ctx->parent = malloc(sizeof(VHDContext));
+                if (ctx->parent) {
+                    if (!vhd_init_internal(ctx->parent, parent_path, 1)) {
+                        free(ctx->parent);
+                        ctx->parent = NULL;
+                    } else {
+                        got_parent = true;
+                    }
+                }
+            }
+        }
+
+        if (!got_parent) {
+            vhd_close(ctx);
+            return false;
+        }
+    }
+
+    return true;
 }
 
-static bool vhd_init_from_runs(VHDContext* ctx, NTFSContext* ntfs, const DataRun* runs,
+static bool vhd_setup_run_source(VHDContext* ctx, NTFSContext* ntfs, const DataRun* runs,
     int run_count, uint64_t file_size, const char* base_dir) {
     memset(ctx, 0, sizeof(VHDContext));
 
@@ -1085,6 +1185,14 @@ static bool vhd_init_from_runs(VHDContext* ctx, NTFSContext* ntfs, const DataRun
     ctx->run_source->bytes_per_cluster = ntfs->bytes_per_cluster;
     memcpy(ctx->run_source->runs, runs, ctx->run_source->run_count * sizeof(DataRun));
     strncpy(ctx->base_dir, base_dir, sizeof(ctx->base_dir) - 1);
+    return true;
+}
+
+static bool vhd_init_from_runs(VHDContext* ctx, NTFSContext* ntfs, const DataRun* runs,
+    int run_count, uint64_t file_size, const char* base_dir) {
+    if (!vhd_setup_run_source(ctx, ntfs, runs, run_count, file_size, base_dir)) {
+        return false;
+    }
 
     if (!vhd_init_common(ctx, base_dir, 0)) {
         vhd_close(ctx);
@@ -1102,7 +1210,15 @@ static bool ntfs_setup_mft(NTFSContext* ctx, uint64_t ntfs_offset) {
 
     ctx->bytes_per_sector = ctx->boot.bytes_per_sector;
     ctx->bytes_per_cluster = (uint32_t)ctx->boot.bytes_per_sector * ctx->boot.sectors_per_cluster;
+
+    if (ctx->bytes_per_sector == 0 || ctx->bytes_per_sector > 4096 ||
+        (ctx->bytes_per_sector & (ctx->bytes_per_sector - 1)) != 0) return false;
+    if (ctx->boot.sectors_per_cluster == 0 ||
+        (ctx->boot.sectors_per_cluster & (ctx->boot.sectors_per_cluster - 1)) != 0) return false;
+
     ctx->mft_offset = ntfs_offset + (ctx->boot.mft_cluster_number * ctx->bytes_per_cluster);
+
+    if (ctx->boot.clusters_per_mft_record < 0 && ctx->boot.clusters_per_mft_record < -31) return false;
 
     if (ctx->boot.clusters_per_mft_record > 0) {
         ctx->mft_record_size = ctx->boot.clusters_per_mft_record * ctx->bytes_per_cluster;
@@ -1110,9 +1226,13 @@ static bool ntfs_setup_mft(NTFSContext* ctx, uint64_t ntfs_offset) {
         ctx->mft_record_size = 1U << (-ctx->boot.clusters_per_mft_record);
     }
 
+    if (ctx->mft_record_size == 0 || ctx->mft_record_size > 65536) return false;
+
     ctx->file_buffer = malloc(BUFFER_SIZE);
     if (!ctx->file_buffer) return false;
+    ctx->cached_dir = INVALID_DIR_HANDLE;
     ctx->last_dir[0] = '\0';
+    ctx->highest_extracted_vhd = -1;
 
     uint8_t* mft_record = malloc(ctx->mft_record_size);
     if (!mft_record) return false;
@@ -1129,10 +1249,11 @@ static bool ntfs_setup_mft(NTFSContext* ctx, uint64_t ntfs_offset) {
         return false;
     }
 
+    uint32_t safe_used = min(record->bytes_used, ctx->mft_record_size);
     const uint8_t* attr = mft_record + record->attrs_offset;
-    while (attr < mft_record + record->bytes_used) {
+    while (attr + sizeof(AttributeHeader) <= mft_record + safe_used) {
         const AttributeHeader* header = (const AttributeHeader*)attr;
-        if (header->type == 0xFFFFFFFF || header->length == 0) break;
+        if (header->type == 0xFFFFFFFF || header->length < sizeof(AttributeHeader)) break;
         if (header->type == DATA_ATTR && header->name_length == 0) {
             if (header->non_resident) {
                 ctx->mft_data_size = header->data.non_resident.data_size;
@@ -1172,7 +1293,7 @@ bool ntfs_init(NTFSContext* ctx, const char* path, const char* extract_path) {
         if (fread(signature, 1, 8, fp) == 8 && memcmp(signature, VHD_COOKIE, 8) == 0) {
             fclose(fp);
             ctx->is_vhd = true;
-            if (!vhd_init(&ctx->vhd, path)) {
+            if (!vhd_init_internal(&ctx->vhd, path, 0)) {
                 free_directory_cache(&ctx->dir_cache);
                 return false;
             }
@@ -1190,23 +1311,12 @@ bool ntfs_init(NTFSContext* ctx, const char* path, const char* extract_path) {
     if (ctx->is_vhd) {
         uint8_t sector[VHD_SECTOR_SIZE];
         if (ntfs_read(ctx, sector, 0, VHD_SECTOR_SIZE)) {
-            if (sector[0x1FE] == 0x55 && sector[0x1FF] == 0xAA) {
-                for (int i = 0; i < 4; i++) {
-                    const uint8_t* part = sector + 0x1BE + (i * 16);
-                    if (part[4] == NTFS_PARTITION_TYPE) {
-                        uint32_t start_sector =
-                            (uint32_t)part[8] |
-                            ((uint32_t)part[9] << 8) |
-                            ((uint32_t)part[10] << 16) |
-                            ((uint32_t)part[11] << 24);
-                        ntfs_offset = (uint64_t)start_sector * VHD_SECTOR_SIZE;
-
-                        if (ntfs_read(ctx, sector, ntfs_offset, VHD_SECTOR_SIZE) &&
-                            memcmp(sector + 3, NTFS_SIGNATURE, 8) == 0) {
-                            found_ntfs = true;
-                            break;
-                        }
-                    }
+            int64_t part_offset = find_ntfs_partition_offset(sector);
+            if (part_offset >= 0) {
+                ntfs_offset = (uint64_t)part_offset;
+                if (ntfs_read(ctx, sector, ntfs_offset, VHD_SECTOR_SIZE) &&
+                    memcmp(sector + 3, NTFS_SIGNATURE, 8) == 0) {
+                    found_ntfs = true;
                 }
             }
         }
@@ -1279,208 +1389,52 @@ bool ntfs_init_stream(NTFSContext* ctx, DecryptStream* stream, const char* extra
     return true;
 }
 
-static uint64_t get_file_data_size(NTFSContext* ctx, const uint8_t* record_data) {
-    const MFTRecordHeader* record = (const MFTRecordHeader*)record_data;
-
-    if (memcmp(record->magic, "FILE", 4) != 0 || !(record->flags & MFT_RECORD_IN_USE)) {
-        return 0;
-    }
-
-    if (record->flags & MFT_RECORD_IS_DIRECTORY) {
-        return 0;
-    }
-
-    char filename[MAX_FILENAME_LENGTH];
-    bool got_filename = false;
-
-    const uint8_t* attr = (const uint8_t*)record + record->attrs_offset;
-    while (attr < (const uint8_t*)record + record->bytes_used) {
-        const AttributeHeader* header = (const AttributeHeader*)attr;
-        if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
-        if (header->type == FILE_NAME_ATTR && !header->non_resident) {
-            const FileNameAttribute* fname =
-                (const FileNameAttribute*)(attr + header->data.resident.value_offset);
-            if (fname->namespace != 2) {
-                fs_name_to_utf8(fname->name, fname->name_length, filename, sizeof(filename));
-                got_filename = true;
-                break;
-            }
-        }
-        attr += header->length;
-    }
-
-    if (!got_filename || filename[0] == '$' || !is_safe_path(filename)) {
-        return 0;
-    }
-
-    attr = (const uint8_t*)record + record->attrs_offset;
-    while (attr < (const uint8_t*)record + record->bytes_used) {
-        const AttributeHeader* header = (const AttributeHeader*)attr;
-        if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
-        if (header->type == DATA_ATTR && header->name_length == 0) {
-            if (header->non_resident) {
-                return header->data.non_resident.data_size;
-            } else {
-                return header->data.resident.value_length;
-            }
-        }
-        attr += header->length;
-    }
-
-    return 0;
-}
-
-static void count_total_bytes(NTFSContext* ctx) {
-    ctx->total_bytes = 0;
-
-    uint8_t* record_buffer = malloc(ctx->mft_record_size);
-    if (!record_buffer) return;
-
-    uint64_t current_offset = ctx->mft_offset;
-    uint64_t total_records = ctx->total_mft_records;
-
-    ctx->raw_file_pos = 0;
-
-    for (uint64_t i = 0; i < total_records; i++) {
-        if (!ntfs_read(ctx, record_buffer, current_offset, ctx->mft_record_size)) {
-            break;
-        }
-
-        if (!apply_mft_fixups(ctx, record_buffer, ctx->mft_record_size)) {
-            current_offset += ctx->mft_record_size;
-            continue;
-        }
-
-        ctx->total_bytes += get_file_data_size(ctx, record_buffer);
-        current_offset += ctx->mft_record_size;
-    }
-
-    free(record_buffer);
-}
-
-int ntfs_detect_vhd_type(NTFSContext* ctx) {
-    uint8_t* record_buffer = malloc(ctx->mft_record_size);
-    if (!record_buffer) return -1;
-
-    uint64_t current_offset = ctx->mft_offset;
-    uint64_t total_records = ctx->total_mft_records;
-    int detected_type = -1;
-
-    ctx->raw_file_pos = 0;
-
-    for (uint64_t i = 0; i < total_records && detected_type == -1; i++) {
-        if (!ntfs_read(ctx, record_buffer, current_offset, ctx->mft_record_size)) {
-            current_offset += ctx->mft_record_size;
-            continue;
-        }
-
-        if (!apply_mft_fixups(ctx, record_buffer, ctx->mft_record_size)) {
-            current_offset += ctx->mft_record_size;
-            continue;
-        }
-
-        const MFTRecordHeader* record = (const MFTRecordHeader*)record_buffer;
-        if (memcmp(record->magic, "FILE", 4) != 0 || !(record->flags & MFT_RECORD_IN_USE)) {
-            current_offset += ctx->mft_record_size;
-            continue;
-        }
-
-        if (record->flags & MFT_RECORD_IS_DIRECTORY) {
-            current_offset += ctx->mft_record_size;
-            continue;
-        }
-
-        char filename[MAX_FILENAME_LENGTH] = {0};
-        const uint8_t* attr = (const uint8_t*)record + record->attrs_offset;
-
-        while (attr < (const uint8_t*)record + record->bytes_used) {
-            const AttributeHeader* header = (const AttributeHeader*)attr;
-            if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
-            if (header->type == FILE_NAME_ATTR && !header->non_resident) {
-                const FileNameAttribute* fname =
-                    (const FileNameAttribute*)(attr + header->data.resident.value_offset);
-                if (fname->namespace != 2) {
-                    fs_name_to_utf8(fname->name, fname->name_length, filename, sizeof(filename));
-                    break;
-                }
-            }
-            attr += header->length;
-        }
-
-        if (strncmp(filename, "internal_", 9) == 0 &&
-            strstr(filename, ".vhd") != NULL) {
-
-            attr = (const uint8_t*)record + record->attrs_offset;
-            while (attr < (const uint8_t*)record + record->bytes_used) {
-                const AttributeHeader* header = (const AttributeHeader*)attr;
-                if (header->type == 0xFFFFFFFF || header->length == 0) break;
-
-                if (header->type == DATA_ATTR && header->name_length == 0 && header->non_resident) {
-                    uint64_t file_size = header->data.non_resident.data_size;
-
-                    if (file_size >= 512) {
-                        DataRun runs[256];
-                        const uint8_t* run_list = attr + header->data.non_resident.mapping_pairs_offset;
-                        size_t run_list_len = header->length - header->data.non_resident.mapping_pairs_offset;
-                        int run_count = parse_data_runs(run_list, run_list_len, runs, 256);
-
-                        uint8_t footer[512];
-                        if (read_bytes_from_runs(ctx, runs, run_count, file_size,
-                                                  file_size - 512, footer, 512)) {
-                            if (memcmp(footer, "conectix", 8) == 0) {
-                                detected_type = (footer[60] << 24) | (footer[61] << 16) |
-                                               (footer[62] << 8) | footer[63];
-                            }
-                        }
-                    }
-                    break;
-                }
-                attr += header->length;
-            }
-        }
-
-        current_offset += ctx->mft_record_size;
-    }
-
-    free(record_buffer);
-    return detected_type;
-}
+#define MFT_BATCH_RECORDS 1024
 
 bool ntfs_extract_all(NTFSContext* ctx) {
     if (!create_directories(ctx->base_path)) return false;
 
-    uint8_t* record_buffer = malloc(ctx->mft_record_size);
-    if (!record_buffer) return false;
-
-    if (!ctx->is_vhd) {
-        count_total_bytes(ctx);
-    }
+    bool ok = true;
     ctx->extracted_bytes = 0;
 
-    if (ctx->verbose && !ctx->silent && ctx->total_bytes > 0) {
-        printf("%llu B\n", (unsigned long long)ctx->total_bytes);
-    }
-
-    Progress progress;
-    if (!ctx->silent && ctx->total_bytes > 0) {
-        progress_init(&progress, ctx->total_bytes);
-        ctx->progress = &progress;
-    }
-
-    uint64_t current_offset = ctx->mft_offset;
     uint64_t total_records = ctx->total_mft_records;
+    uint32_t rec_size = ctx->mft_record_size;
+    size_t batch_buf_size = MFT_BATCH_RECORDS * rec_size;
 
     ctx->raw_file_pos = 0;
+
+    uint8_t* batch_buf = malloc(batch_buf_size);
+    if (!batch_buf) return false;
 
     time_t start_time = time(NULL);
     time_t last_update = start_time;
     uint64_t last_bytes = 0;
+    uint64_t mft_offset = ctx->mft_offset;
+    uint64_t records_left = total_records;
 
-    for (uint64_t i = 0; i < total_records; i++) {
-        if (!ctx->silent && !ctx->progress && ctx->is_vhd) {
+    while (records_left > 0) {
+        uint64_t batch_count = (records_left > MFT_BATCH_RECORDS) ? MFT_BATCH_RECORDS : records_left;
+        size_t batch_bytes = (size_t)(batch_count * rec_size);
+
+        if (!ntfs_read(ctx, batch_buf, mft_offset, batch_bytes)) {
+            ok = false;
+            break;
+        }
+
+        for (uint64_t j = 0; j < batch_count; j++) {
+            uint8_t* record_data = batch_buf + j * rec_size;
+
+            if (!apply_mft_fixups(ctx, record_data, rec_size)) continue;
+
+            if (memcmp(record_data, "FILE", 4) == 0) {
+                process_mft_record(ctx, record_data);
+            }
+        }
+
+        mft_offset += batch_bytes;
+        records_left -= batch_count;
+
+        if (!ctx->silent) {
             time_t now = time(NULL);
             if (now != last_update) {
                 int64_t elapsed = (int64_t)difftime(now, last_update);
@@ -1495,30 +1449,17 @@ bool ntfs_extract_all(NTFSContext* ctx) {
                 last_bytes = ctx->extracted_bytes;
             }
         }
-
-        if (!ntfs_read(ctx, record_buffer, current_offset, ctx->mft_record_size)) break;
-
-        if (!apply_mft_fixups(ctx, record_buffer, ctx->mft_record_size)) break;
-
-        const MFTRecordHeader* record = (const MFTRecordHeader*)record_buffer;
-        if (memcmp(record->magic, "FILE", 4) == 0) {
-            process_mft_record(ctx, record_buffer);
-        }
-
-        current_offset += ctx->mft_record_size;
     }
 
-    if (!ctx->silent && !ctx->progress && ctx->is_vhd) {
+    free(batch_buf);
+
+    if (!ctx->silent && ctx->extracted_bytes > 0) {
         uint64_t total_mb_w = ctx->extracted_bytes / (1024 * 1024);
         uint64_t total_mb_f = (ctx->extracted_bytes % (1024 * 1024)) * 100 / (1024 * 1024);
-        printf("\r%llu.%02llu MB %llu f\n",
+        printf("\r%llu.%02llu MB %llu f %ds          \n",
             (unsigned long long)total_mb_w, (unsigned long long)total_mb_f,
-            (unsigned long long)ctx->files_extracted);
-    }
-
-    if (ctx->progress) {
-        progress_finish(&progress);
-        ctx->progress = NULL;
+            (unsigned long long)ctx->files_extracted,
+            (int)difftime(time(NULL), start_time));
     }
 
     if (ctx->pending_vhd_count == 0 && ctx->deferred_dirs) {
@@ -1532,47 +1473,21 @@ bool ntfs_extract_all(NTFSContext* ctx) {
     ctx->deferred_count = 0;
     ctx->deferred_capacity = 0;
 
-    free(record_buffer);
-    return true;
+    return ok;
 }
 
-bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose, bool* is_orphan) {
-    if (is_orphan) *is_orphan = false;
-    if (ctx->pending_vhd_count == 0) return true;
-
-    int highest_vhd = -1;
-    PendingVHD* highest = NULL;
-    for (int i = 0; i < ctx->pending_vhd_count; i++) {
-        if (ctx->pending_vhds[i].vhd_number > highest_vhd) {
-            highest_vhd = ctx->pending_vhds[i].vhd_number;
-            highest = &ctx->pending_vhds[i];
-        }
-    }
-
-    if (!highest) return true;
-
-    VHDContext vhd_ctx = {0};
-    if (!vhd_init_from_runs(&vhd_ctx, ctx, highest->runs, highest->run_count,
-        highest->file_size, ctx->base_path)) {
-        if (is_orphan) *is_orphan = true;
-        return true;
-    }
-
-    if (vhd_ctx.footer.disk_type == VHD_TYPE_DIFFERENCING) {
-        if (is_orphan) *is_orphan = true;
-        vhd_close(&vhd_ctx);
-        return true;
-    }
-
+bool vhd_extract_ntfs(VHDContext* vhd, const char* base_path,
+                       bool silent, bool verbose,
+                       uint64_t* out_files, uint64_t* out_bytes) {
     NTFSContext inner_ctx = {0};
     inner_ctx.silent = silent;
     inner_ctx.verbose = verbose;
     inner_ctx.is_vhd = true;
-    inner_ctx.vhd = vhd_ctx;
-    strncpy(inner_ctx.base_path, ctx->base_path, sizeof(inner_ctx.base_path) - 1);
+    inner_ctx.vhd = *vhd;
+    strncpy(inner_ctx.base_path, base_path, sizeof(inner_ctx.base_path) - 1);
 
     if (!init_directory_cache(&inner_ctx.dir_cache)) {
-        vhd_close(&inner_ctx.vhd);
+        memset(&inner_ctx.vhd, 0, sizeof(VHDContext));
         return false;
     }
 
@@ -1587,33 +1502,21 @@ bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose, bool
         found_ntfs = true;
     }
 
-    if (!found_ntfs && read_ok && boot[510] == 0x55 && boot[511] == 0xAA) {
-        for (int i = 0; i < 4; i++) {
-            uint8_t* entry = boot + 446 + (i * 16);
-            uint8_t ptype = entry[4];
-            uint32_t lba_start = entry[8] | (entry[9] << 8) | (entry[10] << 16) | (entry[11] << 24);
-
-            if (ptype == NTFS_PARTITION_TYPE && lba_start > 0) {
-                ntfs_offset = (uint64_t)lba_start * 512;
-                if (vhd_read(&inner_ctx.vhd, boot, ntfs_offset, sizeof(boot)) &&
-                    boot[0] == 0xEB && boot[1] == 0x52 && boot[2] == 0x90 &&
-                    memcmp(boot + 3, NTFS_SIGNATURE, 8) == 0) {
-                    found_ntfs = true;
-                    break;
-                }
+    if (!found_ntfs && read_ok) {
+        int64_t part_offset = find_ntfs_partition_offset(boot);
+        if (part_offset >= 0) {
+            ntfs_offset = (uint64_t)part_offset;
+            if (vhd_read(&inner_ctx.vhd, boot, ntfs_offset, sizeof(boot)) &&
+                boot[0] == 0xEB && boot[1] == 0x52 && boot[2] == 0x90 &&
+                memcmp(boot + 3, NTFS_SIGNATURE, 8) == 0) {
+                found_ntfs = true;
             }
         }
     }
 
-    if (!found_ntfs) {
+    if (!found_ntfs || !ntfs_setup_mft(&inner_ctx, ntfs_offset)) {
         free_directory_cache(&inner_ctx.dir_cache);
-        vhd_close(&inner_ctx.vhd);
-        return false;
-    }
-
-    if (!ntfs_setup_mft(&inner_ctx, ntfs_offset)) {
-        free_directory_cache(&inner_ctx.dir_cache);
-        vhd_close(&inner_ctx.vhd);
+        memset(&inner_ctx.vhd, 0, sizeof(VHDContext));
         return false;
     }
 
@@ -1623,28 +1526,183 @@ bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose, bool
     }
 
     bool success = ntfs_extract_all(&inner_ctx);
+    if (out_files) *out_files = inner_ctx.files_extracted;
+    if (out_bytes) *out_bytes = inner_ctx.extracted_bytes;
 
-    ctx->files_extracted += inner_ctx.files_extracted;
-    ctx->extracted_bytes += inner_ctx.extracted_bytes;
-
+    memset(&inner_ctx.vhd, 0, sizeof(VHDContext));
     ntfs_close(&inner_ctx);
+    return success;
+}
 
-    DeferredDirTime* dirs = (DeferredDirTime*)ctx->deferred_dirs;
-    for (uint32_t i = ctx->deferred_count; i > 0; i--) {
-        DeferredDirTime* d = &dirs[i - 1];
-        set_dir_times(d->path, d->mtime, d->atime);
+bool ntfs_init_vhd(NTFSContext* ctx, const char* vhd_path, const char* extract_path,
+                   VHDContext* external_parent) {
+    bool silent = ctx->silent;
+    bool verbose = ctx->verbose;
+    memset(ctx, 0, sizeof(NTFSContext));
+    ctx->silent = silent;
+    ctx->verbose = verbose;
+    ctx->is_vhd = true;
+    strncpy(ctx->base_path, extract_path, sizeof(ctx->base_path) - 1);
+
+    if (!init_directory_cache(&ctx->dir_cache)) return false;
+
+    if (!vhd_init_with_parent(&ctx->vhd, vhd_path, external_parent)) {
+        free_directory_cache(&ctx->dir_cache);
+        return false;
     }
-    free(ctx->deferred_dirs);
-    ctx->deferred_dirs = NULL;
-    ctx->deferred_count = 0;
-    ctx->deferred_capacity = 0;
+
+    uint8_t boot[512];
+    uint64_t ntfs_offset = 0;
+    bool found_ntfs = false;
+
+    if (ntfs_read(ctx, boot, 0, sizeof(boot))) {
+        if (boot[0] == 0xEB && boot[1] == 0x52 && boot[2] == 0x90 &&
+            memcmp(boot + 3, NTFS_SIGNATURE, 8) == 0) {
+            found_ntfs = true;
+        }
+
+        if (!found_ntfs) {
+            int64_t part_offset = find_ntfs_partition_offset(boot);
+            if (part_offset >= 0) {
+                ntfs_offset = (uint64_t)part_offset;
+                if (ntfs_read(ctx, boot, ntfs_offset, sizeof(boot)) &&
+                    memcmp(boot + 3, NTFS_SIGNATURE, 8) == 0) {
+                    found_ntfs = true;
+                }
+            }
+        }
+    }
+
+    if (!found_ntfs || !ntfs_setup_mft(ctx, ntfs_offset)) {
+        if (external_parent && ctx->vhd.parent == external_parent)
+            ctx->vhd.parent = NULL;
+        ntfs_close(ctx);
+        return false;
+    }
+
+    return true;
+}
+
+bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose,
+    const char* parent_file, VHDContext* parent_vhd,
+    bool* is_orphan, VHDContext** out_base_vhd) {
+    if (is_orphan) *is_orphan = false;
+    if (out_base_vhd) *out_base_vhd = NULL;
+    if (ctx->pending_vhd_count == 0) return true;
+
+    int highest_vhd = -1;
+    PendingVHD* highest = NULL;
+    for (int i = 0; i < ctx->pending_vhd_count; i++) {
+        if (ctx->pending_vhds[i].vhd_number > highest_vhd) {
+            highest_vhd = ctx->pending_vhds[i].vhd_number;
+            highest = &ctx->pending_vhds[i];
+        }
+    }
+
+    if (!highest) return true;
+
+    bool used_cached_parent = false;
+    VHDContext vhd_ctx = {0};
+    if (!vhd_init_from_runs(&vhd_ctx, ctx, highest->runs, highest->run_count,
+        highest->file_size, ctx->base_path)) {
+
+        if (!vhd_setup_run_source(&vhd_ctx, ctx, highest->runs, highest->run_count,
+            highest->file_size, ctx->base_path)) {
+            if (is_orphan) *is_orphan = true;
+            return true;
+        }
+
+        if (!vhd_read_footer(&vhd_ctx) || !vhd_init_dynamic_header(&vhd_ctx)) {
+            vhd_close(&vhd_ctx);
+            if (is_orphan) *is_orphan = true;
+            return true;
+        }
+
+        if (vhd_ctx.footer.disk_type != VHD_TYPE_DIFFERENCING) {
+            vhd_close(&vhd_ctx);
+            if (is_orphan) *is_orphan = true;
+            return true;
+        }
+
+        VHDContext* parent_ctx = NULL;
+
+        if (parent_vhd) {
+            if (memcmp(vhd_ctx.dyn_header.parent_id, parent_vhd->footer.unique_id, 16) == 0) {
+                vhd_ctx.parent = parent_vhd;
+                used_cached_parent = true;
+                parent_ctx = parent_vhd;
+            } else {
+                fprintf(stderr, "parent mismatch\n");
+            }
+        }
+
+        if (!parent_ctx) {
+            int parent_vhd_num = -1;
+            PendingVHD* parent_pending = NULL;
+            for (int i = 0; i < ctx->pending_vhd_count; i++) {
+                if (&ctx->pending_vhds[i] == highest) continue;
+                if (ctx->pending_vhds[i].vhd_number > parent_vhd_num) {
+                    parent_vhd_num = ctx->pending_vhds[i].vhd_number;
+                    parent_pending = &ctx->pending_vhds[i];
+                }
+            }
+
+            if (parent_pending) {
+                parent_ctx = malloc(sizeof(VHDContext));
+                if (parent_ctx) {
+                    if (!vhd_init_from_runs(parent_ctx, ctx, parent_pending->runs,
+                        parent_pending->run_count, parent_pending->file_size, ctx->base_path)) {
+                        free(parent_ctx);
+                        parent_ctx = NULL;
+                    }
+                }
+            }
+        }
+
+        if (!parent_ctx && parent_file) {
+            parent_ctx = malloc(sizeof(VHDContext));
+            if (parent_ctx) {
+                if (!vhd_init_internal(parent_ctx, parent_file, 1)) {
+                    free(parent_ctx);
+                    parent_ctx = NULL;
+                }
+            }
+        }
+
+        if (!parent_ctx) {
+            vhd_close(&vhd_ctx);
+            if (is_orphan) *is_orphan = true;
+            return true;
+        }
+
+        if (!used_cached_parent) {
+            vhd_ctx.parent = parent_ctx;
+        }
+    }
+
+    if (out_base_vhd && vhd_ctx.footer.disk_type == VHD_TYPE_DYNAMIC) {
+        *out_base_vhd = malloc(sizeof(VHDContext));
+        if (*out_base_vhd) {
+            memcpy(*out_base_vhd, &vhd_ctx, sizeof(VHDContext));
+            return true;
+        }
+    }
+
+    uint64_t files = 0, bytes = 0;
+    bool success = vhd_extract_ntfs(&vhd_ctx, ctx->base_path, silent, verbose, &files, &bytes);
+    ctx->files_extracted += files;
+    ctx->extracted_bytes += bytes;
+
+    if (!success && is_orphan) *is_orphan = true;
+
+    if (used_cached_parent) {
+        vhd_ctx.parent = NULL;
+    }
+    vhd_close(&vhd_ctx);
 
     return success;
 }
 
-int ntfs_get_pending_opt_count(NTFSContext* ctx) {
-    return ctx ? ctx->pending_opt_count : 0;
-}
 
 const PendingOpt* ntfs_get_pending_opt(NTFSContext* ctx, int index) {
     if (!ctx || index < 0 || index >= ctx->pending_opt_count) return NULL;
@@ -1652,13 +1710,12 @@ const PendingOpt* ntfs_get_pending_opt(NTFSContext* ctx, int index) {
 }
 
 void ntfs_close(NTFSContext* ctx) {
-    if (ctx->stream) {
-    }
-    else if (ctx->is_vhd) {
-        vhd_close(&ctx->vhd);
-    }
-    else {
-        if (ctx->raw.fp) {
+    close_output_dir(ctx->cached_dir);
+    if (!ctx->stream) {
+        if (ctx->is_vhd) {
+            vhd_close(&ctx->vhd);
+        }
+        else if (ctx->raw.fp) {
             fclose(ctx->raw.fp);
         }
     }

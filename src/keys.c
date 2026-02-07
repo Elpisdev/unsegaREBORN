@@ -4,7 +4,6 @@
 typedef struct {
     char game_id[8];
     uint8_t key[16];
-    uint8_t iv[16];
 } ExternalKey;
 
 static ExternalKey* external_keys;
@@ -59,11 +58,6 @@ static void load_keys_from_file(const char* path) {
         char* brace1_end = strchr(brace1, '}');
         if (!brace1_end) continue;
 
-        char* brace2 = strchr(brace1_end, '{');
-        if (!brace2) continue;
-        char* brace2_end = strchr(brace2, '}');
-        if (!brace2_end) continue;
-
         if (external_keys_count >= external_keys_cap) {
             size_t new_cap = external_keys_cap ? external_keys_cap * 2 : 8;
             ExternalKey* new_keys = realloc(external_keys, new_cap * sizeof(ExternalKey));
@@ -77,7 +71,6 @@ static void load_keys_from_file(const char* path) {
         memcpy(k->game_id, quote1 + 1, id_len);
 
         if (!parse_hex_bytes(brace1, brace1_end, k->key, 16)) continue;
-        if (!parse_hex_bytes(brace2, brace2_end, k->iv, 16)) continue;
 
         external_keys_count++;
     }
@@ -102,14 +95,13 @@ bool key_any(void) {
     return count_embedded_keys() > 0 || external_keys_count > 0;
 }
 
-bool key_lookup(const char* id, uint8_t out_key[16], uint8_t out_iv[16], bool* from_external) {
+bool key_lookup(const char* id, uint8_t out_key[16], bool* from_external) {
     try_load_external_keys();
     if (from_external) *from_external = false;
 
     for (size_t i = 0; i < external_keys_count; i++) {
         if (strcmp(external_keys[i].game_id, id) == 0) {
             memcpy(out_key, external_keys[i].key, 16);
-            memcpy(out_iv, external_keys[i].iv, 16);
             if (from_external) *from_external = true;
             return true;
         }
@@ -119,7 +111,6 @@ bool key_lookup(const char* id, uint8_t out_key[16], uint8_t out_iv[16], bool* f
     while (entry->game_id != NULL) {
         if (strcmp(entry->game_id, id) == 0) {
             memcpy(out_key, entry->key, 16);
-            memcpy(out_iv, entry->iv, 16);
             return true;
         }
         entry++;

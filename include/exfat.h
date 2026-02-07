@@ -8,10 +8,8 @@
 #define EXFAT_ENTRY_SIZE 32
 
 #define EXFAT_ENTRY_EOD          0x00
-#define EXFAT_ENTRY_BITMAP       0x81
 #define EXFAT_ENTRY_FILE         0x85
 #define EXFAT_ENTRY_STREAM       0xC0
-#define EXFAT_ENTRY_FILENAME     0xC1
 
 #pragma pack(push, 1)
 
@@ -96,6 +94,15 @@ typedef struct {
     uint64_t atime;
 } DeferredDirTime;
 
+static inline bool grow_deferred_dirs(DeferredDirTime** dirs, uint32_t* capacity) {
+    uint32_t new_cap = *capacity ? *capacity * 2 : 256;
+    DeferredDirTime* new_buf = realloc(*dirs, new_cap * sizeof(DeferredDirTime));
+    if (!new_buf) return false;
+    *dirs = new_buf;
+    *capacity = new_cap;
+    return true;
+}
+
 typedef struct {
     FILE* fp;
     ExfatBootSector boot_sector;
@@ -107,14 +114,14 @@ typedef struct {
     uint32_t* fat;
     uint8_t* cluster_buf;
     uint8_t* io_buf;
-    uint64_t total_bytes;
     uint64_t extracted_bytes;
     uint64_t files_extracted;
-    void* progress;
+    uint64_t raw_file_pos;
     bool silent;
     bool verbose;
     DecryptStream* stream;
     char last_dir[MAX_PATH_LENGTH];
+    DirHandle cached_dir;
     DeferredDirTime* deferred_dirs;
     uint32_t deferred_count;
     uint32_t deferred_capacity;

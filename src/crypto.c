@@ -14,10 +14,6 @@ const uint8_t OPTION_KEY[16] = {
     0x5c, 0x84, 0xa9, 0xe7, 0x26, 0xea, 0xa5, 0xdd,
     0x35, 0x1f, 0x2b, 0x07, 0x50, 0xc2, 0x36, 0x97
 };
-const uint8_t OPTION_IV[16] = {
-    0xc0, 0x63, 0xbf, 0x6f, 0x56, 0x2d, 0x08, 0x4d,
-    0x79, 0x63, 0xc9, 0x87, 0xf5, 0x28, 0x17, 0x61
-};
 const uint8_t APM3_SEED[96] = {
     0xC7, 0x3C, 0xDD, 0xBF, 0x7A, 0xFB, 0x0E, 0xBC, 0xE6, 0xDE, 0xD4, 0xD9, 0xB3, 0xDF, 0x3B, 0x03,
     0x3F, 0xE1, 0x40, 0xE4, 0xF4, 0xFF, 0x96, 0xC5, 0x79, 0x90, 0x8B, 0x5B, 0x69, 0x6A, 0xBE, 0xEE,
@@ -89,7 +85,7 @@ void iv_page(uint64_t off, const uint8_t* base, uint8_t* out) {
     );
 }
 
-bool iv_file(const uint8_t key[16], const uint8_t* hdr, const uint8_t* page, uint8_t out[16]) {
+void iv_file(const uint8_t key[16], const uint8_t* hdr, const uint8_t* page, uint8_t out[16]) {
     uint8_t iv[16];
     uint8_t header[16];
     memcpy(header, page, 16);
@@ -101,12 +97,10 @@ bool iv_file(const uint8_t key[16], const uint8_t* hdr, const uint8_t* page, uin
     AES_CBC_decrypt_buffer(&ctx, header, 16);
 
     memcpy(out, header, 16);
-    return true;
 }
 
 bool key_game(const char* id, GameKeys* out) {
-    if (key_lookup(id, out->key, out->iv, &out->external)) {
-        out->has_iv = true;
+    if (key_lookup(id, out->key, &out->external)) {
         return true;
     }
     out->external = false;

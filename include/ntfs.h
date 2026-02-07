@@ -8,8 +8,6 @@
 #define VHD_FOOTER_SIZE 512
 #define VHD_SECTOR_SIZE 512
 #define VHD_BAT_ENTRY_RESERVED 0xFFFFFFFF
-#define NTFS_RECORD_SIZE 1024
-#define MFT_RECORD_MAGIC "FILE"
 #define VHD_COOKIE "conectix"
 #define VHD_DYNAMIC_COOKIE "cxsparse"
 #define VHD_TYPE_FIXED 2
@@ -18,8 +16,6 @@
 #define VHD_MAX_CHAIN_DEPTH 8
 #define FILE_NAME_ATTR 0x30
 #define DATA_ATTR 0x80
-#define INDEX_ROOT_ATTR 0x90
-#define INDEX_ALLOCATION_ATTR 0xA0
 #define NTFS_SIGNATURE "NTFS    "
 #define NTFS_PARTITION_TYPE 0x07
 #define MFT_RECORD_IN_USE 0x0001
@@ -197,7 +193,6 @@ typedef struct VHDContext {
     struct VHDContext* parent;
     uint32_t depth;
     char base_dir[MAX_PATH_LENGTH];
-    uint64_t file_pos;
 } VHDContext;
 
 typedef struct {
@@ -225,7 +220,6 @@ typedef struct {
     DataRun runs[MAX_DATA_RUNS];
     int run_count;
     uint64_t file_size;
-    uint64_t data_offset;
     char filename[MAX_FILENAME_LENGTH];
 } PendingOpt;
 
@@ -247,10 +241,9 @@ typedef struct {
     uint64_t data_start_offset;
     bool silent;
     bool verbose;
-    uint64_t total_bytes;
     uint64_t extracted_bytes;
     uint64_t files_extracted;
-    void* progress;
+    int highest_extracted_vhd;
     uint64_t raw_file_pos;
     DecryptStream* stream;
     PendingVHD pending_vhds[MAX_PENDING_VHDS];
@@ -258,23 +251,32 @@ typedef struct {
     PendingOpt pending_opts[MAX_PENDING_OPTS];
     int pending_opt_count;
     uint8_t* lookup_buffer;
-    bool apm3_decrypt;
-    uint8_t apm3_key[16];
-    uint8_t apm3_iv[16];
     uint8_t* file_buffer;
     char last_dir[MAX_PATH_LENGTH];
+    DirHandle cached_dir;
     void* deferred_dirs;
     uint32_t deferred_count;
     uint32_t deferred_capacity;
+    uint64_t skip_refs[8];
+    int skip_ref_count;
 } NTFSContext;
 
 bool ntfs_init(NTFSContext* ctx, const char* vhd_path, const char* extract_path);
 bool ntfs_init_stream(NTFSContext* ctx, DecryptStream* stream, const char* extract_path);
-int ntfs_detect_vhd_type(NTFSContext* ctx);
 bool ntfs_extract_all(NTFSContext* ctx);
-bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose, bool* is_orphan);
-int ntfs_get_pending_opt_count(NTFSContext* ctx);
+bool ntfs_extract_pending_vhds(NTFSContext* ctx, bool silent, bool verbose,
+    const char* parent_file, VHDContext* parent_vhd,
+    bool* is_orphan, VHDContext** out_base_vhd);
+bool vhd_extract_ntfs(VHDContext* vhd, const char* base_path,
+                       bool silent, bool verbose,
+                       uint64_t* out_files, uint64_t* out_bytes);
+bool vhd_init_internal(VHDContext* ctx, const char* filename, uint32_t depth);
+bool ntfs_init_vhd(NTFSContext* ctx, const char* vhd_path, const char* extract_path,
+                   VHDContext* external_parent);
 const PendingOpt* ntfs_get_pending_opt(NTFSContext* ctx, int index);
+bool ntfs_read_from_runs(NTFSContext* ctx, const DataRun* runs, int run_count,
+    uint64_t file_size, uint64_t read_offset, void* buffer, size_t read_size);
 void ntfs_close(NTFSContext* ctx);
+void vhd_close(VHDContext* ctx);
 
 #endif

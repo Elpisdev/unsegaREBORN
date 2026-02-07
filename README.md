@@ -4,12 +4,12 @@ SEGA arcade image toolkit
 
 ## features
 
-- APP/OPT/APM3 decryption
-- NTFS/exFAT support
-- VHD support (fixed, dynamic, differencing)
-- stream directly from encrypted image (no temp files)
+- support for APP/PACK and OPT (including APM3 type)
+- support for NTFS and exFAT
+- support for VHD (fixed, dynamic, differencing)
+- stream directly from encrypted image (no temporary files)
 - preserved timestamps
-- AES-NI accelerated with software fallback
+- AES-NI hardware accelerated
 
 ## build
 
@@ -31,11 +31,24 @@ flags:
 - `-n` decrypt only, skip extraction
 - `-w` write intermediate .ntfs/.exfat files
 - `-p file` parent for differencing VHD
+- `-k` keep all versions (each delta gets its own folder instead of stacking)
 - `-s` silent
 - `-v` verbose
 - `-vn` version
 
-drag and drop works on windows
+### deltas (differencing VHD)
+
+base + update files are stacked into a single output directory named after the latest delta. files are automatically sorted by actual order.
+
+```
+unsegareborn -o out -p BASE.opt/app DELTA1.opt/app DELTA2.opt/app
+```
+
+result: `out/DELTA2_*/` with merged content (base + all updates applied in order)
+
+### drag and drop
+
+drag and drop works on windows. multiple files are handled automatically. the earliest file on drag selection order is used as parent, the rest are applied as updates in order. no flags needed.
 
 ## keys
 
@@ -47,8 +60,10 @@ to build from source:
 
 format:
 ```c
-{"SDEZ", {0xd1,0x36,...}, {0xc4,0x84,...}, true},
+{"SDEZ", {0xd1,0x36,...}},
 ```
+
+iv values are derived automatically from the key and ciphertext
 
 ## platforms
 
@@ -62,10 +77,11 @@ format:
 
 ## release
 
-push version tag:
+build generates a version tag automatically (`YYYYMMDDNN`, revision increments per day):
 ```
-git tag 2026020501
-git push origin 2026020501
+sh build.cmd        # or build.cmd on windows
+git tag $(./build/unsegareborn-* -vn | awk '{print $2}')
+git push origin --tags
 ```
 
 ci builds both platforms and creates a github release with binaries
